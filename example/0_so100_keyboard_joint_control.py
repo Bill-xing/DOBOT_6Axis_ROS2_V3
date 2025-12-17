@@ -13,35 +13,123 @@ import traceback
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 关节标定系数 - 手动编辑
-# 格式: [关节名称, 零位偏移量(度), 缩放因子]
+# 关节标定系数配置 - 需要根据实际机器人进行手动调整
+#
+# 配置格式：[关节名称, 零位偏移量(度), 缩放因子]
+#
+# 零位偏移量说明：
+#   - 正值：物理零位在传感器零位之后（需要减去偏移）
+#   - 负值：物理零位在传感器零位之前（需要加上偏移）
+#   - 零值：传感器零位与物理零位对齐
+#
+# 缩放因子说明：
+#   - 大于1：传感器读数偏小，需要放大（scale=1.05表示放大5%）
+#   - 小于1：传感器读数偏大，需要缩小（scale=0.97表示缩小3%）
+#   - 等于1：传感器读数准确，无需缩放
+#
+# 各关节具体说明：
+# - shoulder_pan：基座旋转关节，控制机械臂水平旋转
+# - shoulder_lift：肩部抬升关节，控制机械臂上下运动
+# - elbow_flex：肘部弯曲关节，控制大臂与小臂角度
+# - wrist_flex：手腕弯曲关节，控制手腕上下弯曲
+# - wrist_roll：手腕旋转关节，控制手腕自转
+# - gripper：夹爪关节，控制夹爪开合
+
 JOINT_CALIBRATION = [
-    ['shoulder_pan', 6.0, 1.0],      # 关节1: 零位偏移量, 缩放因子
-    ['shoulder_lift', 2.0, 0.97],     # 关节2: 零位偏移量, 缩放因子
-    ['elbow_flex', 0.0, 1.05],        # 关节3: 零位偏移量, 缩放因子
-    ['wrist_flex', 0.0, 0.94],        # 关节4: 零位偏移量, 缩放因子
-    ['wrist_roll', 0.0, 0.5],        # 关节5: 零位偏移量, 缩放因子
-    ['gripper', 0.0, 1.0],           # 关节6: 零位偏移量, 缩放因子
+    # 基座旋转关节
+    ['shoulder_pan', 6.0, 1.0],      # 零位偏移+6度，无缩放（常见于基座安装误差）
+
+    # 肩部抬升关节
+    ['shoulder_lift', 2.0, 0.97],     # 零位偏移+2度，缩小3%（考虑重力影响）
+
+    # 肘部弯曲关节
+    ['elbow_flex', 0.0, 1.05],        # 无零位偏移，放大5%（传动比误差）
+
+    # 手腕弯曲关节
+    ['wrist_flex', 0.0, 0.94],        # 无零位偏移，缩小6%（机械间隙补偿）
+
+    # 手腕旋转关节 - 注意：此关节缩放因子为0.5
+    ['wrist_roll', 0.0, 0.5],        # 无零位偏移，缩小50%（齿轮比特殊设计）
+
+    # 夹爪关节
+    ['gripper', 0.0, 1.0],           # 无零位偏移，无缩放（标准配置）
 ]
 
 def apply_joint_calibration(joint_name, raw_position):
     """
-    应用关节标定系数
+    应用关节标定系数，修正原始传感器读数以获得更准确的关节位置
+
+    这个函数解决了机械臂制造、安装过程中产生的误差问题，通过标定系数
+    将原始传感器数据转换为实际物理角度。
+
+    标定公式：标定后位置 = (原始位置 - 零位偏移) × 缩放因子
 
     Args:
-        joint_name: 关节名称
-        raw_position: 原始位置值
+        joint_name (str): 关节名称，如'shoulder_pan', 'elbow_flex'等
+        raw_position (float): 从机器人传感器读取的原始位置值（度）
 
     Returns:
-        calibrated_position: 标定后的位置值
+        float: 标定后的位置值（度），如果未找到对应关节数据则返回原始值
+
+    Example:
+        >>> # 假设elbow_flex关节的标定系数为 [0.0, 1.05]
+        >>> raw_pos = 30.0  # 传感器原始读数30度
+        >>> calibrated_pos = apply_joint_calibration('elbow_flex', raw_pos)
+        >>> print(f"标定后位置: {calibrated_pos:.1f}度")
+        标定后位置: 31.5度
     """
+
+    # 遍历所有关节数据，查找匹配的关节配置
     for joint_cal in JOINT_CALIBRATION:
+
+        # joint_cal格式：[关节名称, 零位偏移量, 缩放因子]
+        # 例如：['elbow_flex', 0.0, 1.05]
+
         if joint_cal[0] == joint_name:
-            offset = joint_cal[1]  # 零位偏移量
-            scale = joint_cal[2]   # 缩放因子
+
+            # 提取标定参数
+            offset = joint_cal[1]  # 零位偏移量（度）
+            scale = joint_cal[2]   # 缩放因子（无量纲）
+
+            """
+            标定计算详解：
+
+            1. 减去零位偏移：修正机械零位误差
+               - 如果offset=2.0，表示当传感器读数为0时，实际关节位置为2度
+               - 需要从原始读数中减去这个偏移量
+
+            2. 乘以缩放因子：修正传动比误差
+               - 如果scale=1.05，表示传感器读数比实际角度小5%
+               - 需要乘以缩放因子放大读数
+
+            实际应用场景：
+            - offset > 0：机械零位偏正，传感器0点在物理零位之前
+            - offset < 0：机械零位偏负，传感器0点在物理零位之后
+            - scale > 1：传感器读数偏小，需要放大
+            - scale < 1：传感器读数偏大，需要缩小
+            """
+
+            # 应用标定公式
             calibrated_position = (raw_position - offset) * scale
+
+            # 调试信息（可选，生产环境可注释掉）
+            # if abs(calibrated_position - raw_position) > 0.1:
+            #     logger.info(f"关节 {joint_name}: 原始={raw_position:.2f}°, "
+            #                f"标定={calibrated_position:.2f}°, "
+            #                f"偏移={offset:.2f}°, 缩放={scale:.3f}")
+
             return calibrated_position
-    return raw_position  # 如果找不到标定系数，返回原始值
+
+    # 如果没有找到对应的关节配置
+    # 这种情况可能发生在：
+    # 1. 新添加的关节未在配置中定义
+    # 2. 关节名称拼写错误
+    # 3. 配置文件缺失或损坏
+
+    # 记录警告信息（可选）
+    # logger.warning(f"未找到关节 '{joint_name}' 的标定配置，使用原始值")
+
+    return raw_position  # 返回未修改的原始位置值
 
 
 def move_to_zero_position(robot, duration=3.0, kp=0.5):

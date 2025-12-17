@@ -83,19 +83,66 @@ FPS = 30
 
 class SimpleTeleopArm:
     """
-    使用VR输入和增量动作控制来控制机器人手臂的类。
+    使用VR输入和增量动作控制来控制机器人手臂的类
 
-    该类提供基于逆运动学的手臂控制，具有比例控制功能，
-    用于基于VR控制器输入的平滑移动和夹爪操作。
+    该类实现了基于VR控制器的直观机器人控制，集成了以下关键技术：
+    1. 增量式动作控制：通过检测VR控制器的相对运动来控制机器人
+    2. 逆运动学解算：将3D空间坐标转换为关节角度
+    3. P控制算法：实现平滑、精确的运动控制
+    4. 姿态耦合：保持末端执行器的稳定姿态
+    5. 多自由度协调：同时控制位置和姿态
+
+    VR控制原理：
+    - 使用VR控制器的6DOF数据实现直观的空间控制
+    - 通过检测相对运动而非绝对位置，提供更自然的控制体验
+    - 结合实时逆运动学计算，实现精确的笛卡尔空间控制
+    - 支持多种控制模式：位置控制、姿态控制、夹爪控制
+
+    应用场景：
+    - 机器人遥操作和远程控制
+    - 动作录制和示教
+    - 虚拟现实机器人交互
+    - 机器人技能学习
     """
-    
+
     def __init__(self, joint_map, initial_obs, kinematics, prefix="right", kp=1):
+        """
+        初始化VR控制手臂控制器
+
+        Args:
+            joint_map: 关节映射字典，将逻辑关节名映射到物理关节名
+            initial_obs: 机器人初始观测数据，包含所有关节位置
+            kinematics: 逆运动学求解器实例
+            prefix: 手臂标识符("left"或"right")
+            kp: P控制比例增益，影响响应速度和稳定性
+
+        控制架构设计：
+        1. 状态管理：维护当前和目标状态
+        2. 输入处理：解析和过滤VR数据
+        3. 运动学计算：笛卡尔坐标与关节空间转换
+        4. 控制输出：生成平滑的控制信号
+        """
         self.joint_map = joint_map
-        self.prefix = prefix
-        self.kp = kp
-        self.kinematics = kinematics
-        
-        # 初始关节位置 - 适配XLerobot观察格式
+        self.prefix = prefix  # 区分左右臂，用于日志和调试
+        self.kp = kp  # P控制增益，数值越大响应越快但可能不稳定
+        self.kinematics = kinematics  # 逆运动学求解器
+
+        """
+        初始化关节位置状态：
+
+        从机器人观测数据中读取当前所有关节的实际位置。
+        这些位置值用作控制算法的参考点和状态估计的基础。
+
+        关节列表说明：
+        - shoulder_pan: 基座旋转，水平面内的旋转
+        - shoulder_lift: 肩部抬升，垂直面内的抬升
+        - elbow_flex: 肘部弯曲，大臂与小臂的相对角度
+        - wrist_flex: 手腕弯曲，手腕相对于小臂的角度
+        - wrist_roll: 手腕旋转，手腕的自转角度
+        - gripper: 夹爪开合，控制抓取动作
+        """
+
+        # 初始化关节位置状态 - 适配XLerobot的观测数据格式
         self.joint_positions = {
             "shoulder_pan": initial_obs[f"{prefix}_arm_shoulder_pan.pos"],
             "shoulder_lift": initial_obs[f"{prefix}_arm_shoulder_lift.pos"],
@@ -105,28 +152,91 @@ class SimpleTeleopArm:
             "gripper": initial_obs[f"{prefix}_arm_gripper.pos"],
         }
 
-        # 设置初始x/y为固定值
-        self.current_x = 0.1629
-        self.current_y = 0.1131
-        self.pitch = 0.0
+        """
+        笛卡尔坐标系状态：
 
-        # VR输入的增量控制状态变量
-        self.last_vr_time = 0.0
-        self.vr_deadzone = 0.001  # 最小移动阈值
-        self.max_delta_per_frame = 0.005  # 每帧最大位置变化
+        current_x, current_y: 末端执行器在工作平面中的位置
+        - x轴: 通常对应机器人前后方向
+        - y轴: 通常对应机器人左右方向
+        - 坐标原点: 机器人基座中心
 
-        # 设置步长
-        self.degree_step = 2
-        self.xy_step = 0.005
+        初始位置选择：
+        - 选择工作空间的中心区域
+        - 避免边界和奇异位形
+        - 确保所有关节在安全范围内
+        - 为后续运动提供良好的起始点
+        """
 
-        # P控制目标位置，设置为零位
+        # 初始化笛卡尔坐标状态
+        self.current_x = 0.1629  # 初始x位置(米)，工作空间前方
+        self.current_y = 0.1131  # 初始y位置(米)，工作空间右侧
+        self.pitch = 0.0  # 初始俯仰角(度)，末端垂直向下
+
+        """
+        VR增量控制参数：
+
+        VR控制使用增量式控制策略，检测控制器的相对运动：
+        - 相比绝对位置控制更自然直观
+        - 避免控制器漂移累积误差
+        - 提供连续流畅的控制体验
+        - 适合精细操作任务
+
+        参数调优原则：
+        - 死区太大：响应迟钝，小动作丢失
+        - 死区太小：控制器抖动影响控制精度
+        - 增量太大：运动过于敏感，难以精确控制
+        - 增量太小：需要大幅度移动控制器，效率低下
+        """
+
+        # VR输入的状态管理变量
+        self.last_vr_time = 0.0  # 上次VR更新时间，用于计算时间间隔
+        self.vr_deadzone = 0.001  # 死区阈值(米)，过滤微小抖动
+        self.max_delta_per_frame = 0.005  # 每帧最大位移量(米)，防止突然移动
+
+        """
+        控制步长参数：
+
+        这些参数决定了控制精度和响应速度的平衡：
+        - degree_step: 关节角度控制的最小步长
+        - xy_step: 笛卡尔坐标控制的最小步长
+
+        调优建议：
+        - 新手用户：使用较大的步长，容错性更好
+        - 精细操作：使用较小的步长，精度更高
+        - 快速移动：增加步长，提高效率
+        - 精确定位：减小步长，提高准确性
+        """
+
+        # 控制步长设置
+        self.degree_step = 2  # 角度控制步长(度)，关节直接控制的精度
+        self.xy_step = 0.005  # 位置控制步长(米)，笛卡尔坐标控制的精度
+
+        """
+        P控制目标状态：
+
+        target_positions存储每个关节的目标角度值，
+        P控制器将持续驱动机器人向这些目标位置移动。
+
+        初始化策略：
+        - 设置为安全零位，避免突然移动
+        - 后续通过VR输入或键盘输入更新
+        - 与current_positions的差值产生控制输出
+
+        P控制特点：
+        - 误差越大，控制输出越大
+        - 比例增益Kp影响响应速度
+        - 无积分项：避免累积误差
+        - 无微分项：减少噪声敏感度
+        """
+
+        # 初始化P控制目标位置 - 设置为安全零位
         self.target_positions = {
-            "shoulder_pan": 0.0,
-            "shoulder_lift": 0.0,
-            "elbow_flex": 0.0,
-            "wrist_flex": 0.0,
-            "wrist_roll": 0.0,
-            "gripper": 0.0,
+            "shoulder_pan": 0.0,  # 基座旋转：正前方
+            "shoulder_lift": 0.0,  # 肩部抬升：水平
+            "elbow_flex": 0.0,  # 肘部弯曲：伸直
+            "wrist_flex": 0.0,  # 手腕弯曲：水平
+            "wrist_roll": 0.0,  # 手腕旋转：中位
+            "gripper": 0.0,  # 夹爪：关闭
         }
         self.zero_pos = {
             'shoulder_pan': 0.0,

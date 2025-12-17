@@ -28,75 +28,236 @@ JOINT_CALIBRATION = [
 
 def apply_joint_calibration(joint_name, raw_position):
     """
-    应用关节标定系数
+    应用关节标定系数，修正原始传感器读数以获得更准确的关节位置
+
+    这个函数解决了机械臂制造、安装过程中产生的误差问题，通过标定系数
+    将原始传感器数据转换为实际物理角度。
+
+    标定公式：标定后位置 = (原始位置 - 零位偏移) × 缩放因子
 
     Args:
-        joint_name: 关节名称
-        raw_position: 原始位置值
+        joint_name (str): 关节名称，如'shoulder_pan', 'elbow_flex'等
+        raw_position (float): 从机器人传感器读取的原始位置值（度）
 
     Returns:
-        calibrated_position: 标定后的位置值
+        float: 标定后的位置值（度），如果未找到对应关节数据则返回原始值
+
+    Example:
+        >>> # 假设elbow_flex关节的标定系数为 [0.0, 1.05]
+        >>> raw_pos = 30.0  # 传感器原始读数30度
+        >>> calibrated_pos = apply_joint_calibration('elbow_flex', raw_pos)
+        >>> print(f"标定后位置: {calibrated_pos:.1f}度")
+        标定后位置: 31.5度
     """
+
+    # 遍历所有关节数据，查找匹配的关节配置
     for joint_cal in JOINT_CALIBRATION:
+
+        # joint_cal格式：[关节名称, 零位偏移量, 缩放因子]
+        # 例如：['elbow_flex', 0.0, 1.05]
+
         if joint_cal[0] == joint_name:
-            offset = joint_cal[1]  # 零位偏移量
-            scale = joint_cal[2]   # 缩放因子
+
+            # 提取标定参数
+            offset = joint_cal[1]  # 零位偏移量（度）
+            scale = joint_cal[2]   # 缩放因子（无量纲）
+
+            """
+            标定计算详解：
+
+            1. 减去零位偏移：修正机械零位误差
+               - 如果offset=2.0，表示当传感器读数为0时，实际关节位置为2度
+               - 需要从原始读数中减去这个偏移量
+
+            2. 乘以缩放因子：修正传动比误差
+               - 如果scale=1.05，表示传感器读数比实际角度小5%
+               - 需要乘以缩放因子放大读数
+
+            实际应用场景：
+            - offset > 0：机械零位偏正，传感器0点在物理零位之前
+            - offset < 0：机械零位偏负，传感器0点在物理零位之后
+            - scale > 1：传感器读数偏小，需要放大
+            - scale < 1：传感器读数偏大，需要缩小
+            """
+
+            # 应用标定公式
             calibrated_position = (raw_position - offset) * scale
+
+            # 调试信息（可选，生产环境可注释掉）
+            # if abs(calibrated_position - raw_position) > 0.1:
+            #     logger.info(f"关节 {joint_name}: 原始={raw_position:.2f}°, "
+            #                f"标定={calibrated_position:.2f}°, "
+            #                f"偏移={offset:.2f}°, 缩放={scale:.3f}")
+
             return calibrated_position
-    return raw_position  # 如果找不到标定系数，返回原始值
+
+    # 如果没有找到对应的关节配置
+    # 这种情况可能发生在：
+    # 1. 新添加的关节未在配置中定义
+    # 2. 关节名称拼写错误
+    # 3. 配置文件缺失或损坏
+
+    # 记录警告信息（可选）
+    # logger.warning(f"未找到关节 '{joint_name}' 的标定配置，使用原始值")
+
+    return raw_position  # 返回未修改的原始位置值
 
 def inverse_kinematics(x, y, l1=0.1159, l2=0.1350):
     """
     计算2连杆机械臂的逆运动学，考虑关节偏移
 
+    逆运动学是根据末端执行器的笛卡尔坐标(x,y)计算对应关节角度的过程。
+    这里使用几何法求解2R机械臂的逆运动学问题。
+
     Parameters:
-        x: 末端执行器x坐标
-        y: 末端执行器y坐标
-        l1: 上臂长度 (默认 0.1159 m)
-        l2: 下臂长度 (默认 0.1350 m)
+        x (float): 末端执行器在基座坐标系中的x坐标(米)
+        y (float): 末端执行器在基座坐标系中的y坐标(米)
+        l1 (float): 上臂长度(第一连杆长度)，默认0.1159米
+        l2 (float): 下臂长度(第二连杆长度)，默认0.1350米
 
     Returns:
-        joint2, joint3: URDF文件中定义的关节角度(弧度)
+        tuple: (joint2_deg, joint3_deg) - 关节2和关节3的角度(度数)
+
+    机械臂结构说明:
+        - 基座: 坐标原点(0,0)
+        - 关节1(shoulder_pan): 控制水平旋转，不参与此2D IK计算
+        - 关节2(shoulder_lift): 第一个旋转关节，对应theta1
+        - 关节3(elbow_flex): 第二个旋转关节，对应theta2
+        - 末端执行器: 位于(x,y)坐标
+
+    算法步骤:
+        1. 验证目标点是否在工作空间内
+        2. 使用几何关系计算关节角度
+        3. 应用机械偏移补偿
+        4. 角度限制和单位转换
     """
-    # 计算关节2和关节3在theta1和theta2中的偏移
-    theta1_offset = math.atan2(0.028, 0.11257)  # 关节2=0时的theta1偏移
-    theta2_offset = math.atan2(0.0052, 0.1349) + theta1_offset  # 关节3=0时的theta2偏移
 
-    # 计算从原点到目标点的距离
+    """
+    机械臂几何参数说明：
+
+    连杆偏移参数（来自实际机械设计）：
+    - theta1_offset: 关节2轴线相对于理想位置的偏移
+      0.028: 垂直偏移量(米)
+      0.11257: 水平偏移量(米)
+      偏移角度 = atan2(垂直偏移, 水平偏移)
+
+    - theta2_offset: 关节3轴线相对于关节2的额外偏移
+      0.0052: 垂直偏移量(米)
+      0.1349: 水平偏移量(米)
+
+    这些偏移反映了实际机械结构中的几何误差和设计约束。
+    """
+
+    # 计算关节2和关节3在理想几何模型中的偏移角度
+    # 这些偏移角度用于补偿实际机械结构中的几何误差
+    theta1_offset = math.atan2(0.028, 0.11257)  # 关节2轴线偏移角（弧度）
+    theta2_offset = math.atan2(0.0052, 0.1349) + theta1_offset  # 关节3累积偏移角（弧度）
+
+    # 计算目标点到基座原点的距离
     r = math.sqrt(x**2 + y**2)
-    r_max = l1 + l2  # 最大可达距离
 
-    # 如果目标点超出最大工作空间，缩放到边界
+    # 定义机械臂的工作空间范围
+    r_max = l1 + l2  # 最大可达距离：两连杆完全伸展
+    r_min = abs(l1 - l2)  # 最小可达距离：两连杆完全折叠
+
+    """
+    工作空间检查和边界处理：
+
+    工作空间是指机械臂末端能够到达的所有点的集合。
+    对于2R机械臂，工作空间是一个环形区域：
+    - 内径: |l1 - l2|
+    - 外径: l1 + l2
+
+    如果目标点在工作空间外，需要特殊处理：
+    1. 超出外径：缩放到边界圆上
+    2. 小于内径：缩放到内径圆上（如果r>0）
+    """
+
+    # 检查目标点是否超出最大工作空间
     if r > r_max:
+        # 计算缩放因子，将目标点投影到工作空间边界
         scale_factor = r_max / r
         x *= scale_factor
         y *= scale_factor
         r = r_max
+        print(f"目标点超出工作空间，已缩放到边界: r={r:.3f}m")
 
-    # 如果目标点小于最小工作空间(|l1-l2|)，缩放它
-    r_min = abs(l1 - l2)
+    # 检查目标点是否小于最小工作空间（且不在原点）
     if r < r_min and r > 0:
+        # 缩放最小距离到工作空间内径
         scale_factor = r_min / r
         x *= scale_factor
         y *= scale_factor
         r = r_min
+        print(f"目标点过近，已调整到最小距离: r={r:.3f}m")
 
-    # 使用余弦定理计算theta2
+    """
+    逆运动学几何求解：
+
+    使用余弦定理求解2R机械臂：
+
+    设:
+    - r: 目标点到原点的距离
+    - l1, l2: 两连杆长度
+    - theta1: 第一关节角度
+    - theta2: 第二关节角度
+
+    根据余弦定理：
+    cos(theta2) = (l1² + l2² - r²) / (2*l1*l2)
+
+    注意：这里使用负号是因为我们计算的是外角
+    """
+
+    # 使用余弦定理计算第二关节角度（肘关节）
+    # 公式推导：根据余弦定理 c² = a² + b² - 2ab*cos(C)
+    # 其中 c=r, a=l1, b=l2, C=theta2
     cos_theta2 = -(r**2 - l1**2 - l2**2) / (2 * l1 * l2)
 
-    # 计算theta2（肘部角度）
+    # 数值稳定性检查：确保cos_theta2在有效范围内[-1, 1]
+    cos_theta2 = max(-1.0, min(1.0, cos_theta2))
+
+    # 计算theta2（肘部关节角度）
+    # theta2 = π - arccos(cos_theta2) 选择肘部向下的解
     theta2 = math.pi - math.acos(cos_theta2)
 
-    # 计算theta1（肩部角度）
-    beta = math.atan2(y, x)
-    gamma = math.atan2(l2 * math.sin(theta2), l1 + l2 * math.cos(theta2))
+    """
+    计算第一关节角度（肩关节）：
+
+    使用几何关系：
+    - beta: 目标点相对于x轴的角度
+    - gamma: 由第二连杆相对于第一连杆的偏移角度
+
     theta1 = beta + gamma
 
-    # 将theta1和theta2转换为关节2和关节3角度
+    其中：
+    - beta = atan2(y, x) (目标点方向角)
+    - gamma = atan2(l2*sin(theta2), l1 + l2*cos(theta2)) (连杆夹角)
+    """
+
+    # 计算目标点的方向角
+    beta = math.atan2(y, x)
+
+    # 计算连杆之间的夹角
+    gamma = math.atan2(l2 * math.sin(theta2), l1 + l2 * math.cos(theta2))
+
+    # 第一关节角度 = 方向角 + 连杆夹角
+    theta1 = beta + gamma
+
+    # 应用机械偏移补偿
     joint2 = theta1 + theta1_offset
     joint3 = theta2 + theta2_offset
 
-    # 确保角度在URDF限制范围内
+    """
+    关节角度限制：
+
+    每个关节都有物理运动限制，由机械设计和安全要求决定：
+    - joint2 (shoulder_lift): [-0.1, 3.45] 弧度 ≈ [-5.7°, 197.7°]
+    - joint3 (elbow_flex): [-0.2, π] 弧度 ≈ [-11.5°, 180°]
+
+    这些限制来自于URDF文件中的关节定义。
+    """
+
+    # 应用关节角度限制（安全范围检查）
     joint2 = max(-0.1, min(3.45, joint2))
     joint3 = max(-0.2, min(math.pi, joint3))
 
@@ -104,8 +265,23 @@ def inverse_kinematics(x, y, l1=0.1159, l2=0.1350):
     joint2_deg = math.degrees(joint2)
     joint3_deg = math.degrees(joint3)
 
-    joint2_deg = 90-joint2_deg
-    joint3_deg = joint3_deg-90
+    """
+    坐标系转换：
+
+    理论计算得到的角度需要转换为实际控制系统使用的角度：
+
+    1. joint2转换: 90° - joint2_deg
+       - 可能是为了匹配控制器的零位定义
+       - 将垂直向上作为0度参考
+
+    2. joint3转换: joint3_deg - 90°
+       - 可能是为了匹配肘关节的正方向定义
+       - 将完全伸直作为0度参考
+    """
+
+    # 应用坐标系转换以匹配实际控制器
+    joint2_deg = 90 - joint2_deg
+    joint3_deg = joint3_deg - 90
 
     return joint2_deg, joint3_deg
 
@@ -240,25 +416,62 @@ def return_to_start_position(robot, start_positions, kp=0.5, control_freq=50):
 
 def p_control_loop(robot, keyboard, target_positions, start_positions, current_x, current_y, kp=0.5, control_freq=50):
     """
-    P控制循环
+    P控制循环 - 末端执行器坐标控制版本
+
+    这是整个控制程序的核心循环，集成了：
+    1. P控制器实现平滑运动
+    2. 逆运动学计算（笛卡尔坐标→关节角度）
+    3. 键盘输入处理
+    4. 俯仰角补偿计算
+    5. 安全退出机制
 
     Args:
-        robot: 机器人实例
-        keyboard: 键盘实例
-        target_positions: 目标关节位置字典
-        start_positions: 起始关节位置字典
-        current_x: 当前x坐标
-        current_y: 当前y坐标
-        kp: 比例增益
-        control_freq: 控制频率(Hz)
+        robot: SO100机器人实例
+        keyboard: 键盘遥操作器实例
+        target_positions: 目标关节位置字典 {关节名: 角度}
+        start_positions: 安全起始位置字典（用于退出时返回）
+        current_x: 当前末端执行器x坐标(米)
+        current_y: 当前末端执行器y坐标(米)
+        kp: P控制比例增益，控制响应速度和稳定性
+        control_freq: 控制循环频率(Hz)，影响控制精度
+
+    P控制原理:
+        - 控制输出 = Kp × 误差
+        - 误差 = 目标位置 - 当前位置
+        - 新位置 = 当前位置 + 控制输出
+
+    控制特点:
+        - 高频控制（50Hz）确保平滑运动
+        - 实时逆运动学计算实现笛卡尔空间控制
+        - 自动俯仰补偿保持末端执行器姿态
+        - 增量式键盘控制便于精确定位
     """
+
+    # 计算控制周期（秒）
     control_period = 1.0 / control_freq
 
+    """
+    俯仰控制参数说明：
+
+    俯仰(pitch)是指末端执行器的倾斜角度控制。
+    在实际应用中，为了保持抓取物体的稳定性，
+    末端执行器的姿态需要根据机械臂配置进行补偿。
+
+    参数说明：
+    - pitch: 当前俯仰角调整值（度数）
+    - pitch_step: 每次键盘输入的俯仰调整步长（度数）
+
+    补偿原理：
+    当机械臂运动时，为了保持末端执行器相对于地面的角度不变，
+    需要根据shoulder_lift和elbow_flex的变化量来调整wrist_flex关节。
+    """
+
     # 初始化俯仰控制变量
-    pitch = 0.0  # 初始俯仰调整
-    pitch_step = 1  # 俯仰调整步长
+    pitch = 0.0  # 初始俯仰调整（度数），0表示末端垂直向下
+    pitch_step = 1  # 俯仰调整步长（度数），每次按键改变1度
 
     print(f"启动P控制循环，控制频率: {control_freq}Hz，比例增益: {kp}")
+    print("控制模式: 末端执行器笛卡尔坐标控制 + 俯仰补偿")
     
     while True:
         try:

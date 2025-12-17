@@ -69,66 +69,208 @@ HEAD_MOTOR_MAP = {
 
 class RectangularTrajectory:
     """
-    在x-y平面上生成具有正弦速度曲线的矩形轨迹。
-    矩形被分为4个线段，每段都有平滑的加速/减速。
+    在x-y平面上生成具有正弦速度曲线的矩形轨迹生成器
+
+    这个类实现了机器人末端执行器的矩形路径规划，具有以下特点：
+    1. 平滑的运动轨迹，避免急加速和急减速
+    2. 可配置的矩形尺寸和运动速度
+    3. 基于正弦函数的速度曲线确保运动连续性
+    4. 支持从任意起始点开始运动
+
+    轨迹应用场景：
+    - 机器人性能测试和校准
+    - 演示机械臂的工作空间
+    - 视觉系统标定
+    - 重复性精度测试
+    - 动作序列录制演示
+
+    矩形路径规划：
+    起点(current_x, current_y) →
+    右下角 →
+    右上角 →
+    左上角 →
+    回到起点
     """
+
     def __init__(self, width=0.06, height=0.06, segment_duration=0.91):
         """
-        初始化矩形轨迹参数。
+        初始化矩形轨迹参数
 
         Args:
-            width: 矩形宽度(米)
-            height: 矩形高度(米)
-            segment_duration: 每条线段的时间(秒)
+            width (float): 矩形宽度(米)，默认6cm
+            height (float): 矩形高度(米)，默认6cm
+            segment_duration (float): 每条线段的运动时间(秒)，默认0.91秒
+
+        设计参数说明：
+        - width/height: 定义矩形的大小，应该在机械臂工作空间内
+        - segment_duration: 控制运动速度，时间越长速度越慢
+        - total_duration = 4 × segment_duration: 完整矩形路径时间
+
+        速度特性：
+        - 最大速度: width/segment_duration (水平)
+        - 最大速度: height/segment_duration (垂直)
+        - 平均速度: 总路程/总时间
         """
         self.width = width
         self.height = height
         self.segment_duration = segment_duration
         self.total_duration = 4 * segment_duration
 
+        """
+        轨迹几何参数：
+
+        矩形尺寸考虑因素：
+        1. 机械臂工作空间限制
+        2. 关节角度运动范围
+        3. 末端执行器安全距离
+        4. 避免奇异位形
+
+        推荐尺寸范围：
+        - 工作空间中心: width ≈ 0.05-0.08m, height ≈ 0.05-0.08m
+        - 工作空间边缘: width ≈ 0.03-0.05m, height ≈ 0.03-0.05m
+        """
+
+        # 计算轨迹参数
+        self.perimeter = 2 * (width + height)  # 矩形周长(米)
+        self.average_speed = self.perimeter / self.total_duration  # 平均速度(m/s)
+
     def get_trajectory_point(self, current_x, current_y, t):
         """
-        获取时间t时矩形轨迹的目标x,y位置。
+        获取时间t时矩形轨迹的目标x,y位置
+
+        使用正弦插值函数实现平滑的运动过渡，避免运动过程中的急动(jerk)。
 
         Args:
-            current_x: 起始x位置
-            current_y: 起始y位置
-            t: 轨迹开始后的时间(0到total_duration)
+            current_x (float): 起始x坐标(米)，通常是当前末端位置
+            current_y (float): 起始y坐标(米)，通常是当前末端位置
+            t (float): 轨迹开始后的时间(秒)，范围[0, total_duration]
 
         Returns:
-            tuple: (target_x, target_y)
+            tuple: (target_x, target_y) - 目标位置坐标(米)
+
+        运动分段说明：
+        段0 (0 → segment_duration): 从起点到右下角 (正向x方向)
+        段1 (segment_duration → 2×segment_duration): 从右下到右上 (正向y方向)
+        段2 (2×segment_duration → 3×segment_duration): 从右上到左上 (负向x方向)
+        段3 (3×segment_duration → 4×segment_duration): 从左上回到起点 (负向y方向)
         """
-        # 确定我们在哪个线段
+
+        """
+        轨迹分段处理：
+
+        1. 确定当前运动线段
+        2. 计算线段内的相对时间
+        3. 应用正弦速度曲线
+        4. 线性插值计算目标位置
+        """
+
+        # 确定当前在矩形的哪条边上 (0,1,2,3)
         segment = int(t / self.segment_duration)
+
+        # 计算在当前线段内的时间
         segment_t = t % self.segment_duration
 
-        # 标准化线段时间(0到1)
+        """
+        正弦速度曲线设计：
+
+        使用余弦函数生成S型速度曲线：
+        s(t) = 0.5 × (1 - cos(π × t_norm))
+
+        特性：
+        - t=0: s=0, v=0 (平滑启动)
+        - t=0.5: s=0.5, v=max (最大速度)
+        - t=1: s=1, v=0 (平滑停止)
+
+        优势：
+        1. 消除加速度突变，提高运动平滑性
+        2. 减少机械冲击和振动
+        3. 提高定位精度和重复性
+        """
+
+        # 标准化线段时间到[0,1]范围
         normalized_t = segment_t / self.segment_duration
 
-        # 正弦速度曲线: 平滑加速和减速
-        # s(t) = 0.5 * (1 - cos(π * t)) 给出平滑的0到1过渡
+        # 正弦插值函数 - 生成平滑的S型曲线
         smooth_t = 0.5 * (1 - math.cos(math.pi * normalized_t))
 
-        # 定义相对于起始位置的矩形角点
+        """
+        矩形路径角点定义：
+
+        角点顺序（逆时针）：
+        0: (current_x, current_y) - 起始位置/终点位置
+        1: (current_x + width, current_y) - 右下角
+        2: (current_x + width, current_y + height) - 右上角
+        3: (current_x, current_y + height) - 左上角
+        4: (current_x, current_y) - 回到起点，完成闭合路径
+
+        坐标系约定：
+        - x轴: 水平向右为正
+        - y轴: 垂直向上为正
+        - 原点: 机械臂基座
+        """
+
+        # 定义相对于起始位置的矩形四个角点
         corners = [
-            (current_x, current_y),                           # 起点(左下)
-            (current_x + self.width, current_y),              # 右下
-            (current_x + self.width, current_y + self.height), # 右上
-            (current_x, current_y + self.height),             # 左上
-            (current_x, current_y)                            # 回到起点
+            (current_x, current_y),                           # 角点0: 起点(左下)
+            (current_x + self.width, current_y),              # 角点1: 右下角
+            (current_x + self.width, current_y + self.height), # 角点2: 右上角
+            (current_x, current_y + self.height),             # 角点3: 左上角
+            (current_x, current_y)                            # 角点4: 回到起点
         ]
 
-        # 将线段限制在有效范围
+        # 安全检查：确保segment在有效范围内
         segment = max(0, min(3, segment))
 
-        # 在当前角点和下一个角点之间插值
+        # 获取当前线段的起点和终点
         start_corner = corners[segment]
         end_corner = corners[segment + 1]
 
+        """
+        线性插值计算：
+
+        target = start + (end - start) × smooth_t
+
+        其中：
+        - start: 起始坐标
+        - end: 目标坐标
+        - smooth_t: 正弦插值系数[0,1]
+        - target: 插值结果
+
+        当smooth_t=0时，target=start
+        当smooth_t=1时，target=end
+        """
+
+        # 应用平滑插值计算目标位置
         target_x = start_corner[0] + smooth_t * (end_corner[0] - start_corner[0])
         target_y = start_corner[1] + smooth_t * (end_corner[1] - start_corner[1])
 
         return target_x, target_y
+
+    def get_velocity_at_time(self, t):
+        """
+        计算指定时间的瞬时速度（可选功能）
+
+        Args:
+            t (float): 时间(秒)
+
+        Returns:
+            tuple: (vx, vy) - x和y方向的速度分量(m/s)
+        """
+        segment = int(t / self.segment_duration)
+        segment_t = t % self.segment_duration
+        normalized_t = segment_t / self.segment_duration
+
+        # 正弦速度导数
+        velocity_factor = (math.pi / (2 * self.segment_duration)) * math.sin(math.pi * normalized_t)
+
+        if segment == 0:  # 正x方向
+            return (self.width * velocity_factor, 0)
+        elif segment == 1:  # 正y方向
+            return (0, self.height * velocity_factor)
+        elif segment == 2:  # 负x方向
+            return (-self.width * velocity_factor, 0)
+        else:  # 负y方向
+            return (0, -self.height * velocity_factor)
 
 class SimpleHeadControl:
     def __init__(self, initial_obs, kp=0.81):
