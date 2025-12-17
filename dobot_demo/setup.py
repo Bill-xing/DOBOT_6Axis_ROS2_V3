@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
         'demo = dobot_demo.demo:main',
+        'keyboard_control = dobot_demo.keyboard_control:main',
         ],
     },
 )
