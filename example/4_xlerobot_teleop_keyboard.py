@@ -1,9 +1,9 @@
-# To Run on the host
+# 在主机上运行
 '''python
 PYTHONPATH=src python -m lerobot.robots.xlerobot.xlerobot_host --robot.id=my_xlerobot
 '''
 
-# To Run the teleop:
+# 运行遥操作:
 '''python
 PYTHONPATH=src python -m examples.xlerobot.teleoperate_Keyboard
 '''
@@ -19,7 +19,7 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 from lerobot.model.SO101Robot import SO101Kinematics
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop, KeyboardTeleopConfig
 
-# Keymaps (semantic action: key)
+# 按键映射 (语义动作: 按键)
 LEFT_KEYMAP = {
     'shoulder_pan+': 'q', 'shoulder_pan-': 'e',
     'wrist_roll+': 'r', 'wrist_roll-': 'f',
@@ -27,11 +27,11 @@ LEFT_KEYMAP = {
     'x+': 'w', 'x-': 's', 'y+': 'a', 'y-': 'd',
     'pitch+': 'z', 'pitch-': 'x',
     'reset': 'c',
-    # For head motors
+    # 头部电机
     "head_motor_1+": "<", "head_motor_1-": ">",
     "head_motor_2+": ",", "head_motor_2-": ".",
-    
-    'triangle': 'y',  # Rectangle trajectory key
+
+    'triangle': 'y',  # 矩形轨迹键
 }
 RIGHT_KEYMAP = {
     'shoulder_pan+': '7', 'shoulder_pan-': '9',
@@ -41,7 +41,7 @@ RIGHT_KEYMAP = {
     'pitch+': '1', 'pitch-': '3',
     'reset': '0',
 
-    'triangle': 'Y',  # Rectangle trajectory key
+    'triangle': 'Y',  # 矩形轨迹键
 }
 
 LEFT_JOINT_MAP = {
@@ -61,7 +61,7 @@ RIGHT_JOINT_MAP = {
     "gripper": "right_arm_gripper",
 }
 
-# Head motor mapping
+# 头部电机映射
 HEAD_MOTOR_MAP = {
     "head_motor_1": "head_motor_1",
     "head_motor_2": "head_motor_2",
@@ -69,72 +69,72 @@ HEAD_MOTOR_MAP = {
 
 class RectangularTrajectory:
     """
-    Generates a rectangular trajectory on the x-y plane with sinusoidal velocity profiles.
-    The rectangle is divided into 4 line segments, each with smooth acceleration/deceleration.
+    在x-y平面上生成具有正弦速度曲线的矩形轨迹。
+    矩形被分为4个线段，每段都有平滑的加速/减速。
     """
     def __init__(self, width=0.06, height=0.06, segment_duration=0.91):
         """
-        Initialize rectangular trajectory parameters.
-        
+        初始化矩形轨迹参数。
+
         Args:
-            width: Rectangle width in meters
-            height: Rectangle height in meters  
-            segment_duration: Time for each line segment in seconds
+            width: 矩形宽度(米)
+            height: 矩形高度(米)
+            segment_duration: 每条线段的时间(秒)
         """
         self.width = width
         self.height = height
         self.segment_duration = segment_duration
         self.total_duration = 4 * segment_duration
-        
+
     def get_trajectory_point(self, current_x, current_y, t):
         """
-        Get the target x, y position at time t for the rectangular trajectory.
-        
+        获取时间t时矩形轨迹的目标x,y位置。
+
         Args:
-            current_x: Starting x position
-            current_y: Starting y position
-            t: Time since trajectory start (0 to total_duration)
-            
+            current_x: 起始x位置
+            current_y: 起始y位置
+            t: 轨迹开始后的时间(0到total_duration)
+
         Returns:
             tuple: (target_x, target_y)
         """
-        # Determine which segment we're in
+        # 确定我们在哪个线段
         segment = int(t / self.segment_duration)
         segment_t = t % self.segment_duration
-        
-        # Normalize segment time (0 to 1)
+
+        # 标准化线段时间(0到1)
         normalized_t = segment_t / self.segment_duration
-        
-        # Sinusoidal velocity profile: smooth acceleration and deceleration
-        # s(t) = 0.5 * (1 - cos(π * t)) gives smooth 0 to 1 transition
+
+        # 正弦速度曲线: 平滑加速和减速
+        # s(t) = 0.5 * (1 - cos(π * t)) 给出平滑的0到1过渡
         smooth_t = 0.5 * (1 - math.cos(math.pi * normalized_t))
-        
-        # Define rectangle corners relative to starting position
+
+        # 定义相对于起始位置的矩形角点
         corners = [
-            (current_x, current_y),                           # Start (bottom-left)
-            (current_x + self.width, current_y),              # Bottom-right
-            (current_x + self.width, current_y + self.height), # Top-right  
-            (current_x, current_y + self.height),             # Top-left
-            (current_x, current_y)                            # Back to start
+            (current_x, current_y),                           # 起点(左下)
+            (current_x + self.width, current_y),              # 右下
+            (current_x + self.width, current_y + self.height), # 右上
+            (current_x, current_y + self.height),             # 左上
+            (current_x, current_y)                            # 回到起点
         ]
-        
-        # Clamp segment to valid range
+
+        # 将线段限制在有效范围
         segment = max(0, min(3, segment))
-        
-        # Interpolate between current corner and next corner
+
+        # 在当前角点和下一个角点之间插值
         start_corner = corners[segment]
         end_corner = corners[segment + 1]
-        
+
         target_x = start_corner[0] + smooth_t * (end_corner[0] - start_corner[0])
         target_y = start_corner[1] + smooth_t * (end_corner[1] - start_corner[1])
-        
+
         return target_x, target_y
 
 class SimpleHeadControl:
     def __init__(self, initial_obs, kp=0.81):
         self.kp = kp
         self.degree_step = 1
-        # Initialize head motor positions
+        # 初始化头部电机位置
         self.target_positions = {
             "head_motor_1": initial_obs.get("head_motor_1.pos", 0.0),
             "head_motor_2": initial_obs.get("head_motor_2.pos", 0.0),
@@ -149,16 +149,16 @@ class SimpleHeadControl:
     def handle_keys(self, key_state):
         if key_state.get('head_motor_1+'):
             self.target_positions["head_motor_1"] += self.degree_step
-            print(f"[HEAD] head_motor_1: {self.target_positions['head_motor_1']}")
+            print(f"[头部] head_motor_1: {self.target_positions['head_motor_1']}")
         if key_state.get('head_motor_1-'):
             self.target_positions["head_motor_1"] -= self.degree_step
-            print(f"[HEAD] head_motor_1: {self.target_positions['head_motor_1']}")
+            print(f"[头部] head_motor_1: {self.target_positions['head_motor_1']}")
         if key_state.get('head_motor_2+'):
             self.target_positions["head_motor_2"] += self.degree_step
-            print(f"[HEAD] head_motor_2: {self.target_positions['head_motor_2']}")
+            print(f"[头部] head_motor_2: {self.target_positions['head_motor_2']}")
         if key_state.get('head_motor_2-'):
             self.target_positions["head_motor_2"] -= self.degree_step
-            print(f"[HEAD] head_motor_2: {self.target_positions['head_motor_2']}")
+            print(f"[头部] head_motor_2: {self.target_positions['head_motor_2']}")
 
     def p_control_action(self, robot):
         obs = robot.get_observation()
@@ -210,105 +210,105 @@ class SimpleTeleopArm:
             'gripper': 0.0
         }
         
-        # Rectangular trajectory instance
+        # 矩形轨迹实例
         self.rectangular_trajectory = RectangularTrajectory(
-            width=0.06,          # 6cm wide rectangle
-            height=0.06,         # 4cm tall rectangle  
-            segment_duration=1.01 # 3 seconds per line segment
+            width=0.06,          # 6cm宽矩形
+            height=0.06,         # 6cm高矩形
+            segment_duration=1.01 # 每条线段1.01秒
         )
 
     def move_to_zero_position(self, robot):
-        print(f"[{self.prefix}] Moving to Zero Position: {self.zero_pos} ......")
-        self.target_positions = self.zero_pos.copy()  # Use copy to avoid reference issues
-        
-        # Reset kinematic variables to their initial state
+        print(f"[{self.prefix}] 移动到零位: {self.zero_pos} ......")
+        self.target_positions = self.zero_pos.copy()  # 使用副本避免引用问题
+
+        # 将运动学变量重置为初始状态
         self.current_x = 0.1629
         self.current_y = 0.1131
         self.pitch = 0.0
-        
-        # Don't let handle_keys recalculate wrist_flex - set it explicitly
+
+        # 不让handle_keys重新计算wrist_flex - 显式设置
         self.target_positions["wrist_flex"] = 0.0
-        
+
         action = self.p_control_action(robot)
         robot.send_action(action)
 
     def execute_rectangular_trajectory(self, robot, fps=30):
         """
-        Execute a blocking rectangular trajectory on the x-y plane.
-        
+        在x-y平面上执行阻塞式矩形轨迹。
+
         Args:
-            robot: Robot instance to send actions to
-            fps: Control loop frequency
+            robot: 发送动作的机器人实例
+            fps: 控制循环频率
         """
-        print(f"[{self.prefix}] Starting rectangular trajectory...")
-        print(f"[{self.prefix}] Rectangle: {self.rectangular_trajectory.width:.3f}m x {self.rectangular_trajectory.height:.3f}m")
-        print(f"[{self.prefix}] Duration: {self.rectangular_trajectory.total_duration:.3f}s total")
-        
-        # Store starting position
+        print(f"[{self.prefix}] 启动矩形轨迹...")
+        print(f"[{self.prefix}] 矩形: {self.rectangular_trajectory.width:.3f}m x {self.rectangular_trajectory.height:.3f}m")
+        print(f"[{self.prefix}] 持续时间: {self.rectangular_trajectory.total_duration:.3f}s总计")
+
+        # 存储起始位置
         start_x = self.current_x
         start_y = self.current_y
-        
-        # Execute trajectory
+
+        # 执行轨迹
         start_time = time.time()
         dt = 1.0 / fps
-        
+
         while True:
             current_time = time.time()
             elapsed_time = current_time - start_time
-            
-            # Check if trajectory is complete
+
+            # 检查轨迹是否完成
             if elapsed_time >= self.rectangular_trajectory.total_duration:
-                print(f"[{self.prefix}] Rectangular trajectory completed!")
+                print(f"[{self.prefix}] 矩形轨迹完成!")
                 break
-                
-            # Get target position from trajectory
+
+            # 从轨迹获取目标位置
             target_x, target_y = self.rectangular_trajectory.get_trajectory_point(
                 start_x, start_y, elapsed_time
             )
-            
-            # Update current position
+
+            # 更新当前位置
             self.current_x = target_x
             self.current_y = target_y
-            
-            # Calculate inverse kinematics
+
+            # 计算逆运动学
             try:
                 joint2, joint3 = self.kinematics.inverse_kinematics(self.current_x, self.current_y)
                 self.target_positions["shoulder_lift"] = joint2
                 self.target_positions["elbow_flex"] = joint3
-                
-                # Update wrist_flex coupling
+
+                # 更新wrist_flex耦合
                 self.target_positions["wrist_flex"] = (
                     -self.target_positions["shoulder_lift"]
                     -self.target_positions["elbow_flex"]
                     + self.pitch
                 )
-                
-                # Get action
+
+                # 获取动作
                 action = self.p_control_action(robot)
-                
-                # Determine which arm is executing and send appropriate action structure
+
+                # 确定哪个手臂在执行并发送适当的动作结构
                 if self.prefix == "left":
-                    # Send left arm action with empty actions for other components
+                    # 发送左臂动作，其他组件为空动作
                     robot_action = {**action, **{}, **{}, **{}}
                 elif self.prefix == "right":
-                    # Send right arm action with empty actions for other components
+                    # 发送右臂动作，其他组件为空动作
                     robot_action = {**{}, **action, **{}, **{}}
-                
-                # Send action to robot
+
+                # 发送动作到机器人
                 robot.send_action(robot_action)
-                
-                # Get observation and log data
+
+                # 获取观察值并记录数据
                 obs = robot.get_observation()
                 log_rerun_data(obs, robot_action)
-                
+
             except Exception as e:
-                print(f"[{self.prefix}] IK failed at x={self.current_x:.4f}, y={self.current_y:.4f}: {e}")
+                print(f"[{self.prefix}] 在x={self.current_x:.4f}, y={self.current_y:.4f}时IK失败: {e}")
                 break
-                
-            # Maintain control frequency
+
+            # 保持控制频率
             # busy_wait(dt)
-        
-        print(f"[{self.prefix}] Trajectory execution finished.")
+
+        print(f"[{self.prefix}] 轨迹执行完成。")
 
     def handle_keys(self, key_state):
         # Joint increments
@@ -381,37 +381,37 @@ class SimpleTeleopArm:
     
 
 def main():
-    # Teleop parameters
+    # 遥操作参数
     FPS = 50
-    # ip = "192.168.1.123"  # This is for zmq connection
-    ip = "localhost"  # This is for local/wired connection
+    # ip = "192.168.1.123"  # 用于zmq连接
+    ip = "localhost"  # 用于本地/有线连接
     robot_name = "my_xlerobot_pc"
 
-    # For zmq connection
+    # 用于zmq连接
     # robot_config = XLerobotClientConfig(remote_ip=ip, id=robot_name)
-    # robot = XLerobotClient(robot_config)    
+    # robot = XLerobotClient(robot_config)
 
-    # For local/wired connection
+    # 用于本地/有线连接
     robot_config = XLerobotConfig()
     robot = XLerobot(robot_config)
-    
+
     try:
         robot.connect()
-        print(f"[MAIN] Successfully connected to robot")
+        print(f"[主程序] 成功连接到机器人")
     except Exception as e:
-        print(f"[MAIN] Failed to connect to robot: {e}")
+        print(f"[主程序] 连接机器人失败: {e}")
         print(robot_config)
         print(robot)
         return
-        
+
     init_rerun(session_name="xlerobot_teleop_v2")
 
-    #Init the keyboard instance
+    # 初始化键盘实例
     keyboard_config = KeyboardTeleopConfig()
     keyboard = KeyboardTeleop(keyboard_config)
     keyboard.connect()
 
-    # Init the arm and head instances
+    # 初始化手臂和头部实例
     obs = robot.get_observation()
     kin_left = SO101Kinematics()
     kin_right = SO101Kinematics()
@@ -419,7 +419,7 @@ def main():
     right_arm = SimpleTeleopArm(kin_right, RIGHT_JOINT_MAP, obs, prefix="right")
     head_control = SimpleHeadControl(obs)
 
-    # Move both arms and head to zero position at start
+    # 启动时将双臂和头部移动到零位
     left_arm.move_to_zero_position(robot)
     right_arm.move_to_zero_position(robot)
 
@@ -429,42 +429,42 @@ def main():
             left_key_state = {action: (key in pressed_keys) for action, key in LEFT_KEYMAP.items()}
             right_key_state = {action: (key in pressed_keys) for action, key in RIGHT_KEYMAP.items()}
 
-            # Handle rectangular trajectory for left arm (y key)
+            # 处理左臂矩形轨迹(y键)
             if left_key_state.get('triangle'):
-                print("[MAIN] Left arm rectangular trajectory triggered!")
+                print("[主程序] 左臂矩形轨迹触发!")
                 left_arm.execute_rectangular_trajectory(robot, fps=FPS)
                 continue
 
-            # Handle rectangular trajectory for right arm (Y key)  
+            # 处理右臂矩形轨迹(Y键)
             if right_key_state.get('triangle'):
-                print("[MAIN] Right arm rectangular trajectory triggered!")
+                print("[主程序] 右臂矩形轨迹触发!")
                 right_arm.execute_rectangular_trajectory(robot, fps=FPS)
                 continue
 
-            # Handle reset for left arm
+            # 处理左臂重置
             if left_key_state.get('reset'):
                 left_arm.move_to_zero_position(robot)
-                continue  
+                continue
 
-            # Handle reset for right arm
+            # 处理右臂重置
             if right_key_state.get('reset'):
                 right_arm.move_to_zero_position(robot)
                 continue
 
-            # Handle reset for head motors with '?'
+            # 用'?'处理头部电机重置
             if '?' in pressed_keys:
                 head_control.move_to_zero_position(robot)
                 continue
 
             left_arm.handle_keys(left_key_state)
             right_arm.handle_keys(right_key_state)
-            head_control.handle_keys(left_key_state)  # Head controlled by left arm keymap
+            head_control.handle_keys(left_key_state)  # 头部由左臂键映射控制
 
             left_action = left_arm.p_control_action(robot)
             right_action = right_arm.p_control_action(robot)
             head_action = head_control.p_control_action(robot)
 
-            # Base action
+            # 底座动作
             keyboard_keys = np.array(list(pressed_keys))
             base_action = robot._from_keyboard_to_base_action(keyboard_keys) or {}
 
@@ -472,13 +472,13 @@ def main():
             robot.send_action(action)
 
             obs = robot.get_observation()
-            # print(f"[MAIN] Observation: {obs}")
+            # print(f"[主程序] 观测值: {obs}")
             log_rerun_data(obs, action)
             # busy_wait(1.0 / FPS)
     finally:
         robot.disconnect()
         keyboard.disconnect()
-        print("Teleoperation ended.")
+        print("遥操作结束。")
 
 if __name__ == "__main__":
     main()
