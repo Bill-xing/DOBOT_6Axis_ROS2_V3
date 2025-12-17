@@ -1,70 +1,160 @@
-# 在主机上运行
-'''python
-PYTHONPATH=src python -m lerobot.robots.xlerobot.xlerobot_host --robot.id=my_xlerobot
-'''
+#!/usr/bin/env python3
+"""
+XLerobot 双臂机器人键盘遥操作系统
 
-# 运行遥操作:
-'''python
-PYTHONPATH=src python -m examples.xlerobot.teleoperate_Keyboard
-'''
+这个程序实现了对XLerobot双臂机器人的完整键盘控制，支持以下核心功能：
+1. 双臂独立控制：左右臂分别使用不同的键盘按键区域
+2. 末端执行器坐标控制：基于逆运动学的3D空间控制
+3. 头部电机控制：额外的电机控制功能
+4. 矩形轨迹演示：自动化的矩形路径跟踪
+5. 实时可视化：集成rerun显示系统状态
+
+系统架构：
+- 硬件层：XLerobot双臂机器人 + 头部电机系统
+- 控制层：键盘输入 + 逆运动学解算 + P控制算法
+- 显示层：rerun实时数据可视化
+
+使用前准备：
+1. 启动机器人主机进程（机器人端）
+   python -m lerobot.robots.xlerobot.xlerobot_host --robot.id=my_xlerobot
+
+2. 运行遥操作程序（控制端）
+   python examples/4_xlerobot_teleop_keyboard.py
+
+控制说明：
+- 左手控制区：Q/E（基座旋转）, W/S（前后）, A/D（左右）, Z/X（俯仰）
+- 右手控制区：7/9（基座旋转）, 8/2（前后）, 4/6（左右）, 1/3（俯仰）
+- 夹爪控制：T/G（左夹爪）, +/-（右夹爪）
+- 矩形轨迹：Y/Y（左右臂）, C/0（重置到零位）
+
+技术特点：
+- 基于SO101运动学模型的逆运动学解算
+- 50Hz控制频率确保平滑运动
+- 正弦速度曲线的轨迹生成
+- 安全限制和错误处理机制
+"""
 
 import time
 import numpy as np
 import math
+import logging
 
+# LeRobot核心模块导入
 from lerobot.robots.xlerobot import XLerobotConfig, XLerobot
-# from lerobot.robots.xlerobot import XLerobotClient, XLerobotClientConfig
-from lerobot.utils.robot_utils import busy_wait
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
-from lerobot.model.SO101Robot import SO101Kinematics
-from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop, KeyboardTeleopConfig
+# from lerobot.robots.xlerobot import XLerobotClient, XLerobotClientConfig  # 网络模式（备用）
+from lerobot.utils.robot_utils import busy_wait  # 精确时间控制工具
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data  # 实时可视化
+from lerobot.model.SO101Robot import SO101Kinematics  # SO101机器人运动学模型
+from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop, KeyboardTeleopConfig  # 键盘遥操作
 
-# 按键映射 (语义动作: 按键)
+# 设置日志系统
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 按键映射配置区域
+# ============================================================================
+
+# 左臂键盘映射定义
+# 使用键盘左半部分控制左臂，符合人体工程学设计
+# 映射原则：常用动作分配给更易按的键位
 LEFT_KEYMAP = {
-    'shoulder_pan+': 'q', 'shoulder_pan-': 'e',
-    'wrist_roll+': 'r', 'wrist_roll-': 'f',
-    'gripper+': 't', 'gripper-': 'g',
-    'x+': 'w', 'x-': 's', 'y+': 'a', 'y-': 'd',
-    'pitch+': 'z', 'pitch-': 'x',
-    'reset': 'c',
-    # 头部电机
-    "head_motor_1+": "<", "head_motor_1-": ">",
-    "head_motor_2+": ",", "head_motor_2-": ".",
+    # 基座旋转关节（肩部水平旋转）
+    'shoulder_pan+': 'q',  # Q键：增加基座旋转角度（逆时针）
+    'shoulder_pan-': 'e',  # E键：减少基座旋转角度（顺时针）
 
-    'triangle': 'y',  # 矩形轨迹键
+    # 手腕旋转关节
+    'wrist_roll+': 'r',    # R键：增加手腕旋转角度
+    'wrist_roll-': 'f',    # F键：减少手腕旋转角度
+
+    # 夹爪开合控制
+    'gripper+': 't',       # T键：打开夹爪
+    'gripper-': 'g',       # G键：关闭夹爪
+
+    # 末端执行器位置控制（笛卡尔坐标）
+    'x+': 'w',             # W键：向前移动（+X方向）
+    'x-': 's',             # S键：向后移动（-X方向）
+    'y+': 'a',             # A键：向左移动（+Y方向）
+    'y-': 'd',             # D键：向右移动（-Y方向）
+
+    # 俯仰角度控制
+    'pitch+': 'z',         # Z键：增加俯仰角度（向上）
+    'pitch-': 'x',         # X键：减少俯仰角度（向下）
+
+    # 系统控制
+    'reset': 'c',          # C键：重置到零位
+
+    # 头部电机控制（额外功能）
+    "head_motor_1+": "<",  # <键：头部电机1正向
+    "head_motor_1-": ">",  # >键：头部电机1负向
+    "head_motor_2+": ",",  # ,键：头部电机2正向
+    "head_motor_2-": ".",  # .键：头部电机2负向
+
+    # 轨迹控制
+    'triangle': 'y',       # Y键：启动矩形轨迹跟踪演示
 }
+
+# 右臂键盘映射定义
+# 使用键盘右半部分和数字键区控制右臂
 RIGHT_KEYMAP = {
-    'shoulder_pan+': '7', 'shoulder_pan-': '9',
-    'wrist_roll+': '/', 'wrist_roll-': '*',
-    'gripper+': '+', 'gripper-': '-',
-    'x+': '8', 'x-': '2', 'y+': '4', 'y-': '6',
-    'pitch+': '1', 'pitch-': '3',
-    'reset': '0',
+    # 基座旋转关节
+    'shoulder_pan+': '7',  # 7键：增加基座旋转角度
+    'shoulder_pan-': '9',  # 9键：减少基座旋转角度
 
-    'triangle': 'Y',  # 矩形轨迹键
+    # 手腕旋转关节
+    'wrist_roll+': '/',    # /键：增加手腕旋转角度
+    'wrist_roll-': '*',    # *键：减少手腕旋转角度
+
+    # 夹爪开合控制
+    'gripper+': '+',       # +键：打开夹爪
+    'gripper-': '-',       # -键：关闭夹爪
+
+    # 末端执行器位置控制
+    'x+': '8',             # 8键：向前移动
+    'x-': '2',             # 2键：向后移动
+    'y+': '4',             # 4键：向左移动
+    'y-': '6',             # 6键：向右移动
+
+    # 俯仰角度控制
+    'pitch+': '1',         # 1键：增加俯仰角度
+    'pitch-': '3',         # 3键：减少俯仰角度
+
+    # 系统控制
+    'reset': '0',          # 0键：重置到零位
+
+    # 轨迹控制
+    'triangle': 'Y',       # Y键：启动矩形轨迹跟踪演示
 }
 
+# ============================================================================
+# 关节名称映射配置
+# ============================================================================
+
+# 左臂关节名称映射
+# 将通用的关节名称映射到具体的机器人电机名称
 LEFT_JOINT_MAP = {
-    "shoulder_pan": "left_arm_shoulder_pan",
-    "shoulder_lift": "left_arm_shoulder_lift",
-    "elbow_flex": "left_arm_elbow_flex",
-    "wrist_flex": "left_arm_wrist_flex",
-    "wrist_roll": "left_arm_wrist_roll",
-    "gripper": "left_arm_gripper",
-}
-RIGHT_JOINT_MAP = {
-    "shoulder_pan": "right_arm_shoulder_pan",
-    "shoulder_lift": "right_arm_shoulder_lift",
-    "elbow_flex": "right_arm_elbow_flex",
-    "wrist_flex": "right_arm_wrist_flex",
-    "wrist_roll": "right_arm_wrist_roll",
-    "gripper": "right_arm_gripper",
+    "shoulder_pan": "left_arm_shoulder_pan",    # 左臂基座旋转
+    "shoulder_lift": "left_arm_shoulder_lift",  # 左臂肩部抬升
+    "elbow_flex": "left_arm_elbow_flex",        # 左臂肘部弯曲
+    "wrist_flex": "left_arm_wrist_flex",        # 左臂手腕弯曲
+    "wrist_roll": "left_arm_wrist_roll",        # 左臂手腕旋转
+    "gripper": "left_arm_gripper",              # 左臂夹爪
 }
 
-# 头部电机映射
+# 右臂关节名称映射
+RIGHT_JOINT_MAP = {
+    "shoulder_pan": "right_arm_shoulder_pan",    # 右臂基座旋转
+    "shoulder_lift": "right_arm_shoulder_lift",  # 右臂肩部抬升
+    "elbow_flex": "right_arm_elbow_flex",        # 右臂肘部弯曲
+    "wrist_flex": "right_arm_wrist_flex",        # 右臂手腕弯曲
+    "wrist_roll": "right_arm_wrist_roll",        # 右臂手腕旋转
+    "gripper": "right_arm_gripper",              # 右臂夹爪
+}
+
+# 头部电机名称映射
 HEAD_MOTOR_MAP = {
-    "head_motor_1": "head_motor_1",
-    "head_motor_2": "head_motor_2",
+    "head_motor_1": "head_motor_1",  # 头部电机1（通常用于垂直运动）
+    "head_motor_2": "head_motor_2",  # 头部电机2（通常用于水平运动）
 }
 
 class RectangularTrajectory:
@@ -273,52 +363,213 @@ class RectangularTrajectory:
             return (0, -self.height * velocity_factor)
 
 class SimpleHeadControl:
+    """
+    简化的头部电机控制系统
+
+    这个类实现了对机器人头部电机的精确P控制，支持以下功能：
+    1. 双电机独立控制：两个头部电机分别控制不同的运动方向
+    2. 键盘实时控制：通过键盘输入实时调整头部姿态
+    3. 平滑运动控制：使用P控制算法确保运动的平滑性
+    4. 零位重置功能：一键回到安全零位
+
+    控制原理：
+    - P控制器：output = Kp × error
+    - 误差计算：error = target_position - current_position
+    - 位置更新：new_position = current_position + control_output
+
+    应用场景：
+    - 视觉系统定位：调整摄像头角度
+    - 交互式演示：头部姿态控制
+    - 标定过程：精确的位置调整
+    - 安全操作：快速回到零位
+
+    安全考虑：
+    - 限制步进大小防止过冲
+    - 合理的比例增益避免震荡
+    - 零位保护防止碰撞
+    """
+
     def __init__(self, initial_obs, kp=0.81):
-        self.kp = kp
-        self.degree_step = 1
-        # 初始化头部电机位置
+        """
+        初始化头部控制系统
+
+        Args:
+            initial_obs (dict): 初始观察数据，包含头部电机的当前位置
+            kp (float): 比例增益系数，默认0.81
+                        较高的Kp值提供快速响应但可能引起震荡
+                        较低的Kp值提供平滑运动但响应较慢
+
+        系统参数说明：
+        - degree_step: 每次按键的角度变化量（度）
+        - target_positions: 目标角度位置字典
+        - zero_pos: 安全零位位置（所有电机归零）
+        """
+        self.kp = kp                      # 比例增益系数
+        self.degree_step = 1              # 每次按键调整1度，平衡精度和速度
+
+        # 初始化头部电机目标位置为当前位置
+        # 这样可以确保启动时电机不会突然移动
         self.target_positions = {
             "head_motor_1": initial_obs.get("head_motor_1.pos", 0.0),
             "head_motor_2": initial_obs.get("head_motor_2.pos", 0.0),
         }
+
+        # 定义安全零位（所有电机角度归零）
+        # 这是最安全的头部姿态，通常用于初始化和紧急停止
         self.zero_pos = {"head_motor_1": 0.0, "head_motor_2": 0.0}
 
     def move_to_zero_position(self, robot):
+        """
+        移动头部电机到零位
+
+        这是一个安全操作，将头部移动到预定义的安全位置。
+        通常在以下情况调用：
+        1. 系统初始化时
+        2. 紧急停止时
+        3. 重置操作时
+        4. 结束操作时
+
+        Args:
+            robot: 机器人实例，用于发送控制指令
+        """
+        logger.info("正在将头部电机移动到零位...")
         self.target_positions = self.zero_pos.copy()
+
+        # 计算P控制动作并发送
         action = self.p_control_action(robot)
         robot.send_action(action)
 
+        logger.info(f"头部零位目标: {self.zero_pos}")
+
     def handle_keys(self, key_state):
+        """
+        处理键盘输入，更新头部电机目标位置
+
+        根据按键状态更新目标位置，实现实时控制：
+        - <: head_motor_1 正向旋转
+        - >: head_motor_1 负向旋转
+        - ,: head_motor_2 正向旋转
+        - .: head_motor_2 负向旋转
+
+        Args:
+            key_state (dict): 按键状态字典，包含各按键的按下状态
+        """
+        # 处理头部电机1的控制（< 和 > 键）
         if key_state.get('head_motor_1+'):
             self.target_positions["head_motor_1"] += self.degree_step
-            print(f"[头部] head_motor_1: {self.target_positions['head_motor_1']}")
+            logger.info(f"[头部] head_motor_1: {self.target_positions['head_motor_1']:.1f}°")
+
         if key_state.get('head_motor_1-'):
             self.target_positions["head_motor_1"] -= self.degree_step
-            print(f"[头部] head_motor_1: {self.target_positions['head_motor_1']}")
+            logger.info(f"[头部] head_motor_1: {self.target_positions['head_motor_1']:.1f}°")
+
+        # 处理头部电机2的控制（, 和 . 键）
         if key_state.get('head_motor_2+'):
             self.target_positions["head_motor_2"] += self.degree_step
-            print(f"[头部] head_motor_2: {self.target_positions['head_motor_2']}")
+            logger.info(f"[头部] head_motor_2: {self.target_positions['head_motor_2']:.1f}°")
+
         if key_state.get('head_motor_2-'):
             self.target_positions["head_motor_2"] -= self.degree_step
-            print(f"[头部] head_motor_2: {self.target_positions['head_motor_2']}")
+            logger.info(f"[头部] head_motor_2: {self.target_positions['head_motor_2']:.1f}°")
 
     def p_control_action(self, robot):
+        """
+        计算P控制动作指令
+
+        使用比例控制器计算每个电机的控制输出，实现平滑的位置跟踪。
+
+        控制算法：
+        1. 读取当前电机位置
+        2. 计算位置误差：error = target - current
+        3. 计算控制输出：control = Kp × error
+        4. 更新目标位置：new_pos = current + control
+
+        Args:
+            robot: 机器人实例，用于获取当前观察数据
+
+        Returns:
+            dict: 包含每个电机位置控制指令的字典
+                 格式：{电机名称 + ".pos": 目标位置值}
+        """
+        # 获取当前机器人观察数据
         obs = robot.get_observation()
         action = {}
+
+        # 对每个目标位置电机进行P控制计算
         for motor in self.target_positions:
+            # 获取当前电机位置，如果获取失败则使用0.0作为默认值
             current = obs.get(f"{HEAD_MOTOR_MAP[motor]}.pos", 0.0)
+
+            # 计算位置误差
             error = self.target_positions[motor] - current
+
+            # P控制：控制输出 = 比例增益 × 误差
             control = self.kp * error
+
+            # 计算新的目标位置
             action[f"{HEAD_MOTOR_MAP[motor]}.pos"] = current + control
+
         return action
 
 class SimpleTeleopArm:
+    """
+    简化的机械臂遥操作控制系统
+
+    这个类实现了对单臂机械臂的完整遥操作控制，集成了以下关键技术：
+    1. 逆运动学解算：将笛卡尔坐标转换为关节角度
+    2. P控制算法：实现平滑、精确的运动控制
+    3. 多模式控制：支持位置控制和关节角度控制
+    4. 轨迹跟踪：自动化的矩形路径演示功能
+    5. 键盘接口：直观的键盘控制映射
+
+    控制架构：
+    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
+    │  键盘输入   │ →  │  坐标更新    │ →  │  逆运动学   │
+    │   (x,y,pitch)│    │              │    │    解算     │
+    └─────────────┘    └──────────────┘    └─────────────┘
+                                                      ↓
+    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
+    │  P控制器    │ ←  │  目标关节角  │ ←  │  安全限制   │
+    │   (kp=0.81) │    │              │    │    检查     │
+    └─────────────┘    └──────────────┘    └─────────────┘
+
+    控制模式：
+    1. 笛卡尔坐标控制：通过x,y坐标控制末端位置
+    2. 关节角度控制：直接控制关节旋转角度
+    3. 夹爪开合控制：独立控制夹爪状态
+    4. 自动轨迹跟踪：预设的矩形路径演示
+
+    安全特性：
+    - 工作空间限制，防止机械臂超出安全范围
+    - 平滑的速度曲线，避免突然运动
+    - 零位保护，提供安全的初始和结束位置
+    """
+
     def __init__(self, kinematics, joint_map, initial_obs, prefix="left", kp=0.81):
-        self.kinematics = kinematics
-        self.joint_map = joint_map
-        self.prefix = prefix  # To distinguish left and right arm
-        self.kp = kp
-        # Initial joint positions
+        """
+        初始化机械臂控制系统
+
+        Args:
+            kinematics: 运动学模型实例，用于逆运动学解算
+            joint_map (dict): 关节名称映射字典
+            initial_obs (dict): 初始观察数据，包含当前关节位置
+            prefix (str): 机械臂标识，"left"或"right"，用于区分双臂
+            kp (float): 比例增益系数，默认0.81
+                        0.81是一个经过调试的值，提供良好的响应性和稳定性
+
+        系统参数配置：
+        - degree_step: 关节角度步进，平衡精度和速度
+        - xy_step: 笛卡尔坐标步进，影响末端执行器移动速度
+        - current_x/y: 初始末端位置，位于工作空间中心区域
+        - pitch: 初始俯仰角，水平姿态
+        """
+        self.kinematics = kinematics        # 运动学模型，用于逆运动学计算
+        self.joint_map = joint_map          # 关节名称映射表
+        self.prefix = prefix                # 机械臂标识（"left"或"right"）
+        self.kp = kp                        # P控制器比例增益
+
+        # 初始化当前关节位置（从观察数据中读取）
+        # 这确保了系统启动时不会产生突然的运动
         self.joint_positions = {
             "shoulder_pan": initial_obs[f"{prefix}_arm_shoulder_pan.pos"],
             "shoulder_lift": initial_obs[f"{prefix}_arm_shoulder_lift.pos"],
@@ -327,14 +578,19 @@ class SimpleTeleopArm:
             "wrist_roll": initial_obs[f"{prefix}_arm_wrist_roll.pos"],
             "gripper": initial_obs[f"{prefix}_arm_gripper.pos"],
         }
-        # Set initial x/y to fixed values
-        self.current_x = 0.1629
-        self.current_y = 0.1131
-        self.pitch = 0.0
-        # Set the degree step and xy step
-        self.degree_step = 3
-        self.xy_step = 0.0081
-        # Set target positions to zero for P control
+
+        # 初始化末端执行器笛卡尔坐标位置
+        # 这些值位于机械臂工作空间的舒适区域
+        self.current_x = 0.1629  # 初始X坐标（前方距离，单位：米）
+        self.current_y = 0.1131  # 初始Y坐标（侧方距离，单位：米）
+        self.pitch = 0.0          # 初始俯仰角（水平姿态，单位：度）
+
+        # 控制步长参数
+        self.degree_step = 3      # 关节角度步进（度），适合精确调整
+        self.xy_step = 0.0081     # 笛卡尔坐标步进（米），约8mm，适合精细操作
+
+        # P控制目标位置（初始化为零位）
+        # 这些是控制器试图达到的目标关节角度
         self.target_positions = {
             "shoulder_pan": 0.0,
             "shoulder_lift": 0.0,
@@ -343,6 +599,9 @@ class SimpleTeleopArm:
             "wrist_roll": 0.0,
             "gripper": 0.0,
         }
+
+        # 定义安全的零位位置
+        # 这是所有关节的机械零位，是最安全的姿态
         self.zero_pos = {
             'shoulder_pan': 0.0,
             'shoulder_lift': 0.0,
@@ -351,12 +610,13 @@ class SimpleTeleopArm:
             'wrist_roll': 0.0,
             'gripper': 0.0
         }
-        
-        # 矩形轨迹实例
+
+        # 创建矩形轨迹生成器实例
+        # 用于自动化的轨迹演示和性能测试
         self.rectangular_trajectory = RectangularTrajectory(
-            width=0.06,          # 6cm宽矩形
-            height=0.06,         # 6cm高矩形
-            segment_duration=1.01 # 每条线段1.01秒
+            width=0.06,           # 6cm宽度的矩形轨迹
+            height=0.06,          # 6cm高度的矩形轨迹
+            segment_duration=1.01 # 每条线段1.01秒，确保平滑运动
         )
 
     def move_to_zero_position(self, robot):
@@ -523,19 +783,83 @@ class SimpleTeleopArm:
     
 
 def main():
-    # 遥操作参数
-    FPS = 50
-    # ip = "192.168.1.123"  # 用于zmq连接
-    ip = "localhost"  # 用于本地/有线连接
-    robot_name = "my_xlerobot_pc"
+    """
+    XLerobot双臂机器人遥操作主控制函数
 
-    # 用于zmq连接
+    这个函数是整个系统的入口点和主控制循环，负责完整的系统生命周期管理：
+    1. 系统初始化：硬件连接、软件组件配置
+    2. 设备管理：机器人、键盘、可视化系统的连接和断开
+    3. 控制循环：实时键盘输入处理和多臂协调控制
+    4. 安全管理：零位重置、异常处理、优雅退出
+    5. 数据可视化：实时状态监控和数据记录
+
+    系统架构流程：
+    ┌─────────────────┐
+    │   系统启动      │
+    └────────┬────────┘
+             ↓
+    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+    │  机器人连接      │ →  │  键盘初始化      │ →  │  控制器创建      │
+    │  XLerobot       │    │  KeyboardTeleop │    │  双臂+头部       │
+    └─────────────────┘    └─────────────────┘    └─────────────────┘
+             ↓                                      ↓
+    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+    │  安全零位       │ ←  │  主控制循环      │ →  │  实时可视化      │
+    │  重置所有关节    │    │  键盘输入处理    │    │  rerun显示       │
+    └─────────────────┘    └─────────────────┘    └─────────────────┘
+
+    控制模式优先级：
+    1. 轨迹控制（矩形轨迹）：临时覆盖其他控制
+    2. 重置控制（零位重置）：高优先级安全操作
+    3. 实时控制（键盘操作）：常规操作模式
+    4. 底座控制（移动平台）：额外的运动自由度
+
+    异常处理策略：
+    - 连接失败：详细错误信息和配置诊断
+    - 逆运动学失败：安全停止和错误日志
+    - 键盘输入异常：跳过当前循环继续执行
+    - 优雅退出：确保所有设备安全断开
+
+    Returns:
+        None: 程序正常退出时返回None，异常时会打印错误信息
+
+    环境要求：
+    - Python 3.8+
+    - LeRobot框架
+    - rerun可视化库（可选）
+    - 硬件：XLerobot双臂机器人系统
+    """
+    logger.info("=" * 60)
+    logger.info("XLerobot双臂机器人遥操作系统启动")
+    logger.info("=" * 60)
+
+    # ============================================================================
+    # 第一步：系统参数配置
+    # ============================================================================
+
+    # 遥操作控制参数
+    FPS = 50  # 控制频率，50Hz确保平滑运动和实时响应
+
+    # 网络连接配置
+    # ip = "192.168.1.123"  # 用于ZMQ网络连接（远程模式）
+    ip = "localhost"        # 用于本地/有线连接（默认模式）
+    robot_name = "my_xlerobot_pc"  # 机器人实例标识名称
+
+    # ============================================================================
+    # 第二步：机器人配置和连接
+    # ============================================================================
+
+    # 网络连接模式配置（当需要远程控制时启用）
     # robot_config = XLerobotClientConfig(remote_ip=ip, id=robot_name)
     # robot = XLerobotClient(robot_config)
+    # logger.info(f"使用网络连接模式: {ip}:{robot_name}")
 
-    # 用于本地/有线连接
+    # 本地连接模式配置（USB直连，推荐用于开发调试）
     robot_config = XLerobotConfig()
     robot = XLerobot(robot_config)
+    logger.info("使用本地连接模式（USB直连）")
+    logger.info(f"机器人配置: {robot_config}")
+    logger.info("正在尝试连接机器人...")
 
     try:
         robot.connect()
