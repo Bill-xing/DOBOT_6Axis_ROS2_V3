@@ -32,7 +32,11 @@ from rclpy.qos import QoSProfile, qos_profile_sensor_data
 L1 = 0.138  # Base to Shoulder
 L2 = 0.425  # Upper Arm
 L3 = 0.395  # Forearm
-L4 = 0.100  # Wrist
+L4 = 0.100  # Wrist (Distance from J4 to J5/J6 intersection?)
+# Note: In "Level Hand" strategy, we consider the distance from J4 to Tool Tip
+# This includes L4 (wrist length) + Gripper Length
+L_GRIPPER = 0.15 # Gripper + Flange length (Approximate)
+L_TOOL = L4 + L_GRIPPER
 
 class KeyPoller:
     """Non-blocking keyboard input reader"""
@@ -104,6 +108,7 @@ class DobotTeleop(Node):
 
     def joint_cb(self, msg):
         """Update current joint state"""
+        # ... (remains same)
         # Map message joints to our order
         temp_joints = {}
         for i, name in enumerate(msg.name):
@@ -131,35 +136,56 @@ class DobotTeleop(Node):
         if is_valid:
             self.current_joints = new_joints
             # If we haven't started controlling yet, sync target to current
-            # This prevents jumping on startup
+            # This prevents jumping on startup, UNLESS current is near zero (folded)
             if not hasattr(self, 'initialized_target'):
-                self.target_joints = list(self.current_joints)
+                # Check if robot is folded (all zeros)
+                if all(abs(j) < 0.1 for j in self.current_joints):
+                    self.get_logger().info("检测到机械臂处于零位。自动应用【测试初始姿态】...")
+                    # Set a comfortable starting pose for IK testing
+                    # J2=0 (Vertical), J3=90 (Horizontal), J4=-90 (Level Hand)
+                    # This puts the arm reaching forward, tool horizontal.
+                    self.target_joints = [0.0, 0.0, math.pi/2, -math.pi/2, 0.0, 0.0]
+                else:
+                    self.target_joints = list(self.current_joints)
+                    
                 self.initialized_target = True
-                self.get_logger().info("目标位置已同步至当前位置，准备就绪！")
+                self.get_logger().info("目标位置已初始化，准备就绪！")
 
-    def solve_ik(self, x, y, z):
+    def solve_ik(self, x_ee, y_ee, z_ee):
         """
-        Simplified Analytic IK for 3-DOF Positioning (Joint 1, 2, 3)
-        Keeps wrist joints (4,5,6) at current values (or fixed relative to arm).
+        Calculates J1, J2, J3, J4 to reach (x, y, z) with the End-Effector,
+        while maintaining a LEVEL HAND (Horizontal Pitch).
         """
-        # 1. Joint 1 (Base Yaw)
-        theta1 = math.atan2(y, x)
+        # Strategy:
+        # 1. We want Tool Tip at (x_ee, y_ee, z_ee) with Pitch = 0 (Horizontal)
+        # 2. This implies the Wrist Center (J4) is at a specific offset behind the Tool Tip.
+        #    Since Pitch=0, the tool points along the horizontal radial vector.
+        #    R_wrist = R_ee - L_TOOL
+        #    Z_wrist = Z_ee
         
-        # 2. Project to 2D plane (r, z)
-        # r is horizontal distance from base frame (excluding L1 vertical offset)
-        # z_arm is height relative to shoulder axis
-        r_ground = math.sqrt(x*x + y*y)
-        # r = r_ground
-        # But wait, we need to account for L2, L3 reaching to (r, z)
-        # Coordinate system transformation
-        # Target (r, z) in shoulder frame
-        # Z axis is up. Shoulder axis is at height L1.
+        # 1. Joint 1 (Base Yaw) - Determined by EE XY direction
+        # Note: We assume the tool points in the same direction as the arm plane
+        theta1 = math.atan2(y_ee, x_ee)
         
-        target_z = z - L1
-        target_r = r_ground
+        # Calculate horizontal distance to EE
+        r_ee = math.sqrt(x_ee**2 + y_ee**2)
         
-        # Triangle formed by L2, L3, and the chord C connecting shoulder to wrist center
-        # distance from shoulder to target
+        # Back-calculate Wrist Center target (r, z)
+        # Assuming Level Hand: Wrist is just behind EE horizontally
+        r_wrist_target = r_ee - L_TOOL
+        z_wrist_target = z_ee
+        
+        # If the target is too close (inside the body), we might fail
+        if r_wrist_target < 0:
+            return None
+
+        # --- Solve 3-DOF IK for Wrist Center (Same logic as before) ---
+        
+        # Target (r, z) in shoulder frame (Z axis is up, Shoulder at L1)
+        target_z = z_wrist_target - L1
+        target_r = r_wrist_target
+        
+        # Distance from shoulder to wrist center
         dist_sq = target_r**2 + target_z**2
         dist = math.sqrt(dist_sq)
         
@@ -168,92 +194,87 @@ class DobotTeleop(Node):
             return None
             
         # Law of Cosines for elbow angle (theta3)
-        # dist^2 = L2^2 + L3^2 - 2*L2*L3*cos(pi - theta3)  <-- definition depends on zero config
-        # Let's use standard convention:
-        # alpha = angle(Shoulder->Target, Shoulder->Elbow)
-        # beta = angle(Shoulder->Target, Horizon)
-        
-        # Internal angle at Elbow
         cos_angle_elbow = (L2**2 + L3**2 - dist_sq) / (2 * L2 * L3)
-        # Clamp for safety
         cos_angle_elbow = max(-1.0, min(1.0, cos_angle_elbow))
         angle_elbow = math.acos(cos_angle_elbow)
         
-        # For CR5, theta3=0 usually means arm straight up or straight horizontal?
-        # Usually elbow=0 is 90 degrees bent or straight. 
-        # Let's assume standard geometric IK: 
-        # theta3 represents deviation from a straight line or relative angle.
-        # Let's calc theta2 (Shoulder) and theta3 (Elbow) relative to horizontal/previous link.
-        
-        # Angle of chord
+        # Calculate theta2 (Shoulder)
+        # beta: Angle of chord (Shoulder->Wrist) from horizon
         beta = math.atan2(target_z, target_r)
         
-        # Angle between chord and L2 using law of cosines
+        # angle_shoulder_internal: Angle between chord and L2
         cos_angle_shoulder_internal = (dist_sq + L2**2 - L3**2) / (2 * dist * L2)
         cos_angle_shoulder_internal = max(-1.0, min(1.0, cos_angle_shoulder_internal))
         angle_shoulder_internal = math.acos(cos_angle_shoulder_internal)
         
-        # Resulting angles (standard anthropomorphic arm config, elbow up)
-        # Theta2: Angle of L2 from horizon. 
-        # CAUTION: Setup depends on robot zero position.
-        # User guide says: Home=[0,0,0,0,0,0]. 
-        # Typically Joint 2=0 is vertical, Joint 3=0 is vertical relative to L2?
-        # We need to tune this offset. 
-        # Assuming Joint 2=0 is UP, + is Backward?
-        # Let's approximate: 
-        # If Joint 2=0 is vertical:
-        # theta2 = -(pi/2 - (beta + angle_shoulder_internal)) 
-        # This part requires tuning based on URDF or empirical trial.
-        # Let's stick to the logic from 'enhanced_keyboard_control.py' which assumed:
-        # theta2 = alpha - beta
-        # theta3 = acos(...)
+        # theta2_geo: Angle of L2 from horizon
+        theta2_geo = beta + angle_shoulder_internal
         
-        # We will iterate incrementally instead of absolute IK if possible, or use the provided simpler logic:
-        # Recalculate based on current pose logic
+        # theta3_geo: Angle of L3 relative to L2 direction
+        # Note: Geometry definition typically has elbow 'up' or 'down'. 
+        # Here assuming simple elbow-up config usually used.
+        # External angle at elbow is PI - internal_angle. 
+        # If L2 is up, L3 goes down.
+        theta3_geo = -(math.pi - angle_elbow)
         
-        theta2 = beta + angle_shoulder_internal
-        # Theta3 is angle of L3 relative to L2.
-        # External angle is what matters?
-        theta3_internal = angle_elbow
-        theta3 = -(math.pi - theta3_internal) # Elbow down/up choice
-        
-        # Corrections for Dobot CR5 Zero-Frame:
-        # Standard: joint1=0 (X+), joint2=0 (Up), joint3=0 (rel Up)
-        # Our calculated theta1 is from X axis. Direct match.
-        # Our calculated theta2 is from Horizon. 
-        # If Joint2=0 is vertical (Z+), then joint_val = pi/2 - theta2.
-        # If Joint3=0 is parallel to L2, then joint_val = theta3.
-        
-        # Apply offsets (Approximation, user can adjust)
+        # Map to Robot Joint Values (CR5 Conventions)
+        # J1 = atan2(y, x)
         j1 = theta1
-        j2 = (math.pi / 2) - theta2 
-        j3 = theta3
         
-        return [j1, j2, j3]
+        # J2: 0 is Vertical Up. theta2_geo is angle from Horizon.
+        # If L2 is horizontal, theta2_geo=0, J2 should be 90 (pi/2).
+        # If L2 is vertical up, theta2_geo=90, J2 should be 0.
+        j2 = (math.pi / 2) - theta2_geo
+        
+        # J3: 0 is aligned with L2? Or vertical?
+        # Typically J3 is relative to L2 in serial chain.
+        # If J3=0 means straight arm, then J3 = theta3_geo (which is ~0 when straight).
+        j3 = theta3_geo 
+        
+        # --- Solve J4 for Level Hand ---
+        # We want Global Pitch of Tool = 0 (Horizontal)
+        # Global Pitch = Angle_L2 + Angle_L3_rel + Angle_J4_rel
+        # Angle_L2_global = theta2_geo
+        # Angle_L3_global = theta2_geo + theta3_geo
+        # Tool_Pitch_global = Angle_L3_global + j4_val
+        # 0 = theta2_geo + theta3_geo + j4
+        # => j4 = -(theta2_geo + theta3_geo)
+        
+        # Adjust for J4 zero definition.
+        # If J4=0 means aligned with L3, then yes.
+        # Let's verify J4 limits/definitions if possible. Assuming standard.
+        j4 = -(theta2_geo + theta3_geo)
+        
+        return [j1, j2, j3, j4]
 
 
     def get_current_xyz(self):
-        """Forward Kinematics for J1, J2, J3 to get roughly X,Y,Z"""
-        j1, j2, j3 = self.current_joints[0], self.current_joints[1], self.current_joints[2]
+        """Forward Kinematics to get End-Effector Position"""
+        j1, j2, j3, j4 = self.current_joints[0], self.current_joints[1], self.current_joints[2], self.current_joints[3]
         
-        # Geometric FK
-        # Projection on plane
-        # angles in geometric formula (theta2 from horizon)
+        # 1. Calculate Wrist Center (Standard FK)
         theta2_geo = (math.pi / 2) - j2
-        theta3_geo = j3 # relative
+        theta3_geo = j3 
         
-        # Global angles
         angle_l2 = theta2_geo
         angle_l3 = theta2_geo + theta3_geo
         
-        # R and Z
-        r = L2 * math.cos(angle_l2) + L3 * math.cos(angle_l3)
-        z = L1 + L2 * math.sin(angle_l2) + L3 * math.sin(angle_l3)
+        r_wrist = L2 * math.cos(angle_l2) + L3 * math.cos(angle_l3)
+        z_wrist = L1 + L2 * math.sin(angle_l2) + L3 * math.sin(angle_l3)
         
-        x = r * math.cos(j1)
-        y = r * math.sin(j1)
+        # 2. Calculate Tool Tip from Wrist Center
+        # Global angle of J4 (Hand)
+        # Assuming J4 is relative pitch
+        angle_hand = angle_l3 + j4
         
-        return x, y, z
+        # Add tool vector
+        r_ee = r_wrist + L_TOOL * math.cos(angle_hand)
+        z_ee = z_wrist + L_TOOL * math.sin(angle_hand)
+        
+        x_ee = r_ee * math.cos(j1)
+        y_ee = r_ee * math.sin(j1)
+        
+        return x_ee, y_ee, z_ee
 
     def run(self):
         print_help()
@@ -296,6 +317,19 @@ class DobotTeleop(Node):
             self.target_joints = [0.0] * 6
             return
 
+        elif key == 't':
+            # Test Pose (Ready for IK)
+            self.get_logger().info("移动到测试姿态...")
+            # Puts arm forward, horizontal tool
+            self.target_joints = [0.0, 0.0, math.pi/2, -math.pi/2, 0.0, 0.0]
+            return
+        elif key == '[':
+            self.get_logger().info("夹爪动作: [关闭]")
+            return
+        elif key == ']':
+            self.get_logger().info("夹爪动作: [打开]")
+            return
+
         if self.mode == "JOINT":
             # Joint Mappings
             # 1/2: J1, 3/4: J2, ...
@@ -334,10 +368,11 @@ class DobotTeleop(Node):
             if dx != 0 or dy != 0 or dz != 0:
                 new_ik = self.solve_ik(x + dx, y + dy, z + dz)
                 if new_ik:
-                    # Update J1-J3, keep J4-J6
+                    # Update J1-J4 (J4 is used for level hand)
                     self.target_joints[0] = new_ik[0]
                     self.target_joints[1] = new_ik[1]
                     self.target_joints[2] = new_ik[2]
+                    self.target_joints[3] = new_ik[3]
 
     def enforce_limits(self):
         # Soft limits (approximate)
@@ -388,7 +423,8 @@ def print_help():
     print("DOBOT 机械臂键盘遥控程序 (精简版)")
     print("="*60)
     print("模式切换: M (关节控制 <-> 笛卡尔坐标控制)")
-    print("复位归零: R")
+    print("复位归零: R  |  测试姿态: T (推荐用于IK测试)")
+    print("夹爪控制: [ (关闭) / ] (打开)")
     print("退出程序: Q")
     print("\n关节控制模式按键:")
     print("  1/2: 关节 1 +/-")
