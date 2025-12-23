@@ -63,6 +63,7 @@ class FollowJointTrajectoryServer(Node):
         P1.j5 = float(j5)
         P1.j6 = float(j6)
         P1.t = 0.2
+        P1.param_value = ["lookahead_time=50,gain=500"]
         response = self.ServoJ_l.call_async(P1)
         # self.spin_until_future_complete(response)  # 等待响应
         # self.get_logger().info(f"{response.result()}")
