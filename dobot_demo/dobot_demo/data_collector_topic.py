@@ -11,9 +11,19 @@ import json
 # 引入dobot_msgs_v3的所有服务
 from dobot_msgs_v3.srv import *
 
+from dobot_msgs_v3.msg import ToolVectorActual
+from sensor_msgs.msg import JointState  
+from std_msgs.msg import Float64
+
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+
+
 class DobotRosWrapper(Node):
     """
-    ROS2 Node封装，用于处理所有Service通信
+    ROS2 Node封装：
+    1. Service Client: 用于发送控制指令 (写)
+    2. Topic Subscriber: 用于实时获取状态 (读) - 解决卡顿的关键
     """
     def __init__(self, node_name="dobot_api_client"):
         super().__init__(node_name)
@@ -40,10 +50,52 @@ class DobotRosWrapper(Node):
         self.cli_set_hold_regs = self.create_client(SetHoldRegs, '/dobot_bringup_v3/srv/SetHoldRegs')
         self.cli_get_hold_regs = self.create_client(GetHoldRegs, '/dobot_bringup_v3/srv/GetHoldRegs')
 
+        # ================== Subscribers (状态缓存) ==================
+        # 缓存变量，初始化为 None
+        # self.cache_pose = None
+        # self.cache_joints = None
+        self.cache_gripper_pos = None
+
+
+        # # 如果发布者是 Reliable (默认)，订阅者必须也是 Reliable 才能通信
+        # # 为了兼容性，我们通常使用 KeepLast(1) + Reliable 即可解决大部分卡顿
+        # compatible_qos = QoSProfile(
+        #     history=HistoryPolicy.KEEP_LAST,
+        #     depth=1, # <--- 核心修改：只处理最新数据
+        #     reliability=ReliabilityPolicy.RELIABLE
+        # )
+
+        # # 订阅机械臂末端位姿 (来自 feedback.py)
+        # self.sub_tool = self.create_subscription(
+        #     ToolVectorActual, 
+        #     '/dobot_msgs_v3/msg/ToolVectorActual', 
+        #     self.tool_callback, 
+        #     compatible_qos
+        # )
+
+        # # 订阅机械臂关节角度
+        # self.sub_joints = self.create_subscription(
+        #     JointState,
+        #     '/joint_states_robot',
+        #     self.joint_callback,
+        #     compatible_qos
+        # )
+
+        self.pub_gripper_update = self.create_publisher(Float64, "/gripper/command_update", 10)
+
         # 等待服务上线 (简单检查几个关键服务)
         self.get_logger().info("Waiting for Dobot services...")
-        if not self.cli_mov_j.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn("Dobot services not available yet. Please ensure driver is running.")
+        if not self.cli_servo_p.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn("Dobot services not available yet. Ensure driver is running.")
+
+    # # --- 回调函数：只负责更新缓存，极快 ---
+    # def tool_callback(self, msg):
+    #     # 将 ToolVectorActual 转换为列表 [x, y, z, rx, ry, rz]
+    #     self.cache_pose = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
+
+    # def joint_callback(self, msg):
+    #     # 转换为角度列表
+    #     self.cache_joints = [p * 180.0 / 3.14159265358979 for p in msg.position]
 
     def call_service(self, client, request):
         """同步调用服务并返回结果"""
@@ -52,12 +104,13 @@ class DobotRosWrapper(Node):
             return None
         
         future = client.call_async(request)
-        # 等待结果，这里的wait依赖于外部线程的spin，或者我们手动等待
+        # 等待结果，这里的wait依赖于外部线程的spin
+        # 注意：因为我们有了独立接收线程，这里可以用 future.done() 轮询
         while not future.done():
-            time.sleep(0.001)
+            time.sleep(0.002) 
         
         return future.result()
-    
+
     def call_service_async_no_wait(self, client, request):
         """
         [新增] 异步调用服务，不等待结果 (非阻塞)
@@ -69,196 +122,152 @@ class DobotRosWrapper(Node):
         # 发送请求后直接返回，不等待 future 完成
         client.call_async(request)
 
-
+ 
 class GripperController:
-    """
-    DH-Robotics AG系列夹爪控制器 (Modbus-RTU)
-    适配 ROS 2 Service 架构
-    """
     def __init__(self, wrapper):
         self.wrapper = wrapper
         self.id = 0
+        self.current_target_pos = 1000 # 本地维护一个目标位置缓存
         self.init_gripper_connection()
 
     def init_gripper_connection(self):
-        # 1. 关闭旧连接 (1-4) 防止占用
+        # ... (初始化 Modbus 连接逻辑保持不变) ...
         for i in range(1, 5):
             req = ModbusClose.Request()
             req.index = i
             self.wrapper.call_service(self.wrapper.cli_modbus_close, req)
         
-        # 2. 创建 Modbus 连接 (115200, 8, 1, N)
         req = ModbusCreate.Request()
         req.ip = "127.0.0.1"
         req.port = 60000
         req.slave_id = 1
         req.is_rtu = 1
-        
         res = self.wrapper.call_service(self.wrapper.cli_modbus_create, req)
         
         if res and res.res == 0:
             try:
                 self.id = int(res.index)
-            except (ValueError, TypeError):
-                # 兼容可能的字符串返回
+            except: 
                 match = re.search(r'(\d+)', str(res.index))
                 self.id = int(match.group(1)) if match else 0
-
-            print(f"Gripper Connected, Modbus Index: {self.id}")
+            print(f"Gripper Connected: {self.id}")
         else:
-            print(":( Gripper ModbusCreate Failed")
             self.id = 0
         
         if self.id > 0:
-            self.enable()     # 初始化使能
-            self.set_force(60) # 设置默认力度/速度
-
-    # ================= 核心写指令 =================
+            self.enable()
+            self.set_force(60)
+            # 初始化时，发送一次当前状态给 Relay
+            self.sync_state_to_relay() 
 
     def enable(self):
-        """初始化夹爪 (0x0100 -> 256)"""
-        # 写入 1 进行初始化
         self._write_regs(256, 1, "1")
-        # 写入 0xA5 (165) 可以重新标定回零 (如果更换指尖需要用这个)
-        # self._write_regs(256, 1, "165") 
 
     def set_force(self, force: int):
-        """
-        设置夹持力/速度 (0x0101 -> 257)
-        :param force: 20-100 (%)
-        """
-        if not (20 <= force <= 100):
-            print("Force must be between 20 and 100")
-            force = max(20, min(100, force))
+        force = max(20, min(100, force))
         self._write_regs(257, 1, str(force))
 
-    def move(self, position: int, wait=False):
+    def move(self, position: int):
         """
-        动态控制开合位置 (0x0103 -> 259)
-        :param position: 0-1000 (千分比)
-                         0 = 完全闭合
-                         1000 = 完全张开
+        移动夹爪并同步状态到 ROS
         """
-        if not (0 <= position <= 1000):
-            print("Position must be between 0 and 1000")
-            position = max(0, min(1000, position))
-        self._write_regs(259, 1, str(position), wait=wait)
+        position = max(0, min(1000, position))
+        
+        # 1. 发送硬件指令 (通过 Service)
+        self._write_regs(259, 1, str(position))
+        
+        # 2. 更新本地缓存
+        self.current_target_pos = position
+        
+        # 3. 发送 ROS 消息通知 JointStateRelay 更新状态
+        # msg = Float64()
+        # msg.data = float(position)
+        # self.wrapper.pub_gripper_update.publish(msg)
 
-    def open(self, speed=None, wait=True):
-        """完全张开 (或张开到指定上限)"""
+    def open(self, speed=None):
         if speed: self.set_force(speed)
-        # 用户之前提到800，这里保留灵活性，默认1000
-        self.move(1000, wait=wait) 
+        self.move(1000)
 
-    def close(self, speed=None, wait=True):
-        """完全闭合"""
+    def close(self, speed=None):
         if speed: self.set_force(speed)
-        self.move(0, wait=wait)
+        self.move(0)
 
-    # ================= 核心读指令 (状态反馈) =================
+    def sync_state_to_relay(self):
+        """强制发送一次当前位置给 Relay"""
+        # 只有在初始化时调用一次读取，为了获取当前真实的物理位置
+        val = self._read_regs(514, 1)
+        if val is not None:
+            self.current_target_pos = val
+            msg = Float64()
+            msg.data = float(val)
+            self.wrapper.pub_gripper_update.publish(msg)
 
-    def get_run_state(self):
-        """
-        获取夹持状态 (0x0201 -> 513)
-        Return:
-            0: 运动中
-            1: 到达位置 (未夹到物体)
-            2: 夹住物体 (成功抓取)
-            3: 物体掉落
-            -1: 读取失败
-        """
-        val = self._read_regs(513, 1)
-        return val if val is not None else -1
-
+    # === 获取状态：直接返回本地指令记录，不再读硬件 ===
     def get_current_position(self):
-        """
-        获取实时位置 (0x0202 -> 514)
-        Return: 0-1000
-        """
-        return self._read_regs(514, 1)
+        return self.current_target_pos
 
-    def is_gripped(self):
-        """判断是否成功夹住物体"""
-        # 状态2代表夹住物体
-        return self.get_run_state() == 2
-
-    def is_moving(self):
-        """判断是否正在运动"""
-        return self.get_run_state() == 0
-    
-    def sync(self):
-        while self.is_moving():
-            time.sleep(0.001)
-
-    # ================= 底层 Modbus 封装 =================
-
-    def _write_regs(self, addr, count, val_tab, val_type=None, wait=True):
+    def _write_regs(self, addr, count, val_tab):
         if self.id <= 0: return
         req = SetHoldRegs.Request()
         req.index = self.id
         req.addr = addr
         req.count = count
         req.val_tab = val_tab
-        if val_type:
-            req.val_type = val_type
-        if wait:
-            # 只有初始化时需要等待
-            self.wrapper.call_service(self.wrapper.cli_set_hold_regs, req)
-        else:
-            # [核心修改] 遥操作运动时，使用不等待的调用
-            self.wrapper.call_service_async_no_wait(self.wrapper.cli_set_hold_regs, req)
+        # 使用 call_async 且不等待，进一步降低延迟
+        self.wrapper.cli_set_hold_regs.call_async(req)
 
-    def _read_regs(self, addr, count, val_type=None):
-        """
-        读取保持寄存器并解析返回值
-        """
+    def _read_regs(self, addr, count):
+        # 仅在初始化使用
         if self.id <= 0: return None
-        
-        # Dobot 的 GetHoldRegs 服务通常需要通过 GetInRegs 或者特定的 Read 服务
-        # 注意：在 dobot_msgs_v3 中通常用 GetHoldRegs
         req = GetHoldRegs.Request()
         req.index = self.id
         req.addr = addr
         req.count = count
-        if val_type: req.val_type = val_type
-        
         res = self.wrapper.call_service(self.wrapper.cli_get_hold_regs, req)
-        if res and res.res == 0: # 0 表示成功
-            try:
-                return int(res.value)
-            except:
-                pass
+        if res and res.res == 0:
+            try: return int(res.value)
+            except: pass
         return None
+
 
 class Robot:
     """
-    最外层调用接口，模拟 Windows API 风格
+    机器人接口类
     """
     def __init__(self):
-        # 初始化 ROS 2
         if not rclpy.ok():
             rclpy.init()
         
         self.node = DobotRosWrapper()
         
-        # 在后台线程运行 ROS 节点，避免阻塞主程序
+        # 后台线程运行 ROS Spin，负责接收 Topic 和处理 Service 回调
         self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
         self.spin_thread.start()
         
         print(">.< 正在连接 ROS 服务... >.<")
         
-        # 初始化夹爪
+        # # 等待第一次数据到达，确保 get_pose 能拿到值
+        # self._wait_for_initial_data()
+
         try:
             self.gripper = GripperController(self.node)
         except Exception as e:
             print(f":( 夹爪初始化警告: {e}")
 
-        # 机器人初始化流程
         self.enable_robot()
         self.set_speed_factor(100)
         self.clear_error()
-        self.position_init()
         print(">.< 连接成功! >.<")
+
+    # def _wait_for_initial_data(self):
+    #     print("等待初始位姿数据...")
+    #     timeout = 5.0
+    #     start = time.time()
+    #     while self.node.cache_pose is None:
+    #         time.sleep(0.1)
+    #         if time.time() - start > timeout:
+    #             print("警告: 未收到机械臂位姿反馈，可能是 feedback 节点未启动")
+    #             break
 
     def enable_robot(self):
         req = EnableRobot.Request()
@@ -273,52 +282,9 @@ class Robot:
         req.ratio = ratio
         self.node.call_service(self.node.cli_speed_factor, req)
 
-    def position_init(self):
-        self.clear_error()
-        # 初始位置示例
-        self.move_to(-100.0, -250.0, 300.0, 180.0, 0.0, 90.0)
+    # ------------------ 运动封装 (写操作，走 Service) ------------------
 
-    # ------------------ 核心运动封装 ------------------
-
-    def MovJ(self, x, y, z, rx, ry, rz, *dynParams):
-        req = MovJ.Request()
-        req.x = float(x)
-        req.y = float(y)
-        req.z = float(z)
-        req.rx = float(rx)
-        req.ry = float(ry)
-        req.rz = float(rz)
-        if dynParams:
-            req.param_value = [str(p) for p in dynParams]
-        return self.node.call_service(self.node.cli_mov_j, req)
-
-    def MovL(self, x, y, z, rx, ry, rz, *dynParams):
-        # Windows API 中有人叫 MovP，但在 PDF 文档中对应直线运动通常是 MovL
-        req = MovL.Request()
-        req.x = float(x)
-        req.y = float(y)
-        req.z = float(z)
-        req.rx = float(rx)
-        req.ry = float(ry)
-        req.rz = float(rz)
-        if dynParams:
-            req.param_value = [str(p) for p in dynParams]
-        return self.node.call_service(self.node.cli_mov_l, req)
-
-    def ServoJ(self, j1, j2, j3, j4, j5, j6, t=0.0, param_value=None):
-        req = ServoJ.Request()
-        req.j1 = float(j1)
-        req.j2 = float(j2)
-        req.j3 = float(j3)
-        req.j4 = float(j4)
-        req.j5 = float(j5)
-        req.j6 = float(j6)
-        req.t = float(t) if t else 0.1
-        if param_value:
-             req.param_value = param_value if isinstance(param_value, list) else [param_value]
-        return self.node.call_service(self.node.cli_servo_j, req)
-
-    def ServoP(self, x, y, z, rx, ry, rz,):
+    def ServoP(self, x, y, z, rx, ry, rz):
         req = ServoP.Request()
         req.x = float(x)
         req.y = float(y)
@@ -326,13 +292,45 @@ class Robot:
         req.rx = float(rx)
         req.ry = float(ry)
         req.rz = float(rz)
-        return self.node.call_service(self.node.cli_servo_p, req)
+        # ServoP 不需要等待返回结果即可发送下一个，为了流畅性
+        # 使用 call_async 但不等待 future，实现“发后即忘”
+        self.node.cli_servo_p.call_async(req)
 
+    def MovJ(self, x, y, z, rx, ry, rz, *dynParams):
+        req = MovJ.Request()
+        req.x, req.y, req.z = float(x), float(y), float(z)
+        req.rx, req.ry, req.rz = float(rx), float(ry), float(rz)
+        if dynParams:
+            req.param_value = [str(p) for p in dynParams]
+        return self.node.call_service(self.node.cli_mov_j, req)
+
+    def MovL(self, x, y, z, rx, ry, rz, *dynParams):
+        req = MovL.Request()
+        req.x, req.y, req.z = float(x), float(y), float(z)
+        req.rx, req.ry, req.rz = float(rx), float(ry), float(rz)
+        if dynParams:
+            req.param_value = [str(p) for p in dynParams]
+        return self.node.call_service(self.node.cli_mov_l, req)
+    
     def Sync(self):
         req = Sync.Request()
         return self.node.call_service(self.node.cli_sync, req)
 
-    # ------------------ 获取姿态 ------------------
+    # ------------------ 读状态 (核心修改：读缓存) ------------------
+
+    # def get_pose(self):
+    #     """
+    #     获取笛卡尔坐标：直接返回缓存
+    #     Return: [x, y, z, rx, ry, rz]
+    #     """
+    #     return self.node.cache_pose
+
+    # def get_angle(self):
+    #     """
+    #     获取关节角：直接返回缓存
+    #     Return: [j1, j2, j3, j4, j5, j6]
+    #     """
+    #     return self.node.cache_joints
 
     def get_pose(self):
         """
@@ -371,81 +369,10 @@ class Robot:
         print("GetAngle 解析失败，原始返回:", res)
         return None
 
-    # ------------------ 高级封装 ------------------
-
-    def move_to(self, x, y, z, rx, ry, rz, sync=True):
-        self.MovJ(x, y, z, rx, ry, rz)
-        if sync:
-            self.Sync()
-
-    def pick(self, x, y, z, rx, ry, rz, add_z=0, sync=True):
-        # 移动到上方
-        self.move_to(x, y, z + 100, rx, ry, rz, sync=sync)
-        # 下降取货
-        self.move_to(x, y, z + add_z, rx, ry, rz, sync=True)
-        self.gripper.close()
-        # 抬起
-        self.move_to(x, y, z + 100, rx, ry, rz, sync=sync)
-
-    def place(self, x, y, z, rx, ry, rz, sync=True):
-        # 移动到上方
-        self.move_to(x, y, z + 100, rx, ry, rz, sync=sync)
-        # 下降放货
-        self.move_to(x, y, z, rx, ry, rz, sync=True)
-        self.gripper.open()
-        # 抬起
-        self.move_to(x, y, z + 100, rx, ry, rz, sync=sync)
-
+    # ------------------ 其他 ------------------
     def close(self):
         rclpy.shutdown()
         self.Sync()
-
-
-# # ================= 使用示例 =================
-# if __name__ == '__main__':
-#     try:
-#         robot = Robot()
-        
-#         # 获取当前姿态
-#         print("Current Pose:", robot.get_pose())
-#         print("Current Joints:", robot.get_angle())
-
-
-#         robot.gripper.sync()
-#         robot.gripper.close()
-#         robot.gripper.sync()
-#         print('close')
-        
-#         # Servo 测试
-#         for _ in range(10):
-#             joints = robot.get_angle()
-#             robot.ServoJ(joints[0], joints[1], joints[2], joints[3], joints[4], joints[5]+1)
-#             time.sleep(0.03)
-#         print('servoj')
-
-#         robot.gripper.open()
-#         robot.gripper.sync()
-#         print('open')
-
-#         for _ in range(20):
-#             poses = robot.get_pose()
-#             robot.ServoP(poses[0], poses[1], poses[2], poses[3]+1, poses[4], poses[5])
-#             time.sleep(0.03)
-#         print('servop')
-
-#         robot.gripper.close()
-#         robot.gripper.sync()
-
-#         for i in range(100):
-#             p = robot.gripper.get_current_position()
-#             robot.gripper.move(p+10)
-#             # robot.gripper.sync()
-        
-#     except KeyboardInterrupt:
-#         print("Exiting...")
-#     finally:
-#         if 'robot' in locals():
-#             robot.close()
 
 
 import time
@@ -535,11 +462,14 @@ class TeleopController:
         """获取初始姿态"""
         retries = 0
         while retries < 5:
+            print(111)
             pose = self.robot.get_pose()
+            print(222)
             if pose:
                 self.target_pose = pose
                 # 读取夹爪当前位置，如果读取失败默认为1000
                 g_pos = self.robot.gripper.get_current_position()
+                print(333)
                 if g_pos is not None:
                     self.target_gripper_pos = g_pos
                 return

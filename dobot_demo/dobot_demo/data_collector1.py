@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# 控制脚本baseline 发布夹爪信息（不带时间戳） 配合joint_states新版本
 
 import rclpy
 from rclpy.node import Node
@@ -7,6 +6,7 @@ import time
 import threading
 import re
 import json
+from std_msgs.msg import Float64
 
 # 引入dobot_msgs_v3的所有服务
 from dobot_msgs_v3.srv import *
@@ -39,6 +39,9 @@ class DobotRosWrapper(Node):
         self.cli_modbus_close = self.create_client(ModbusClose, '/dobot_bringup_v3/srv/ModbusClose')
         self.cli_set_hold_regs = self.create_client(SetHoldRegs, '/dobot_bringup_v3/srv/SetHoldRegs')
         self.cli_get_hold_regs = self.create_client(GetHoldRegs, '/dobot_bringup_v3/srv/GetHoldRegs')
+
+
+        self.pub_gripper_update = self.create_publisher(Float64, "/gripper/command_update", 2)
 
         # 等待服务上线 (简单检查几个关键服务)
         self.get_logger().info("Waiting for Dobot services...")
@@ -112,6 +115,7 @@ class GripperController:
         if self.id > 0:
             self.enable()     # 初始化使能
             self.set_force(60) # 设置默认力度/速度
+            self.sync_state_to_relay()
 
     # ================= 核心写指令 =================
 
@@ -143,6 +147,10 @@ class GripperController:
             print("Position must be between 0 and 1000")
             position = max(0, min(1000, position))
         self._write_regs(259, 1, str(position), wait=wait)
+        self.current_target_pos = position
+        msg = Float64()
+        msg.data = float(position)
+        self.wrapper.pub_gripper_update.publish(msg)
 
     def open(self, speed=None, wait=True):
         """完全张开 (或张开到指定上限)"""
@@ -189,6 +197,16 @@ class GripperController:
     def sync(self):
         while self.is_moving():
             time.sleep(0.001)
+
+    def sync_state_to_relay(self):
+        """强制发送一次当前位置给 Relay"""
+        # 只有在初始化时调用一次读取，为了获取当前真实的物理位置
+        val = self._read_regs(514, 1)
+        if val is not None:
+            self.current_target_pos = val
+            msg = Float64()
+            msg.data = float(val)
+            self.wrapper.pub_gripper_update.publish(msg)
 
     # ================= 底层 Modbus 封装 =================
 
@@ -469,6 +487,7 @@ class TeleopController:
         self.MOUSE_SENSITIVITY = 0.1 # 鼠标移动 -> mm 的比例
         self.SCROLL_SENSITIVITY = 2.0 # 滚轮 -> 角度的比例
         self.KEY_XYZ_STEP = 0.3     # 键盘控制 Z (Space/Ctrl) 的步长 (mm)
+        self.KEY_XYZ_STEP_FAST = 0.6     # 键盘控制 Z (Space/Ctrl) 的步长 (mm)
         self.KEY_ROT_STEP = 0.3     # 键盘控制旋转 (WASD) 的步长 (度)
         self.GRIPPER_STEP = 40      # 夹爪每次按下的变化量 (0-1000)
 
@@ -653,10 +672,14 @@ class TeleopController:
             # 键盘控制 Z 轴
             if keyboard.Key.space in self.keys_pressed:
                 self.target_pose[2] += self.KEY_XYZ_STEP * time_rate
+                if keyboard.Key.alt in self.keys_pressed or keyboard.Key.alt_r in self.keys_pressed:
+                    self.target_pose[2] += (self.KEY_XYZ_STEP_FAST - self.KEY_XYZ_STEP) * time_rate
             if keyboard.Key.ctrl in self.keys_pressed or \
                keyboard.Key.ctrl_l in self.keys_pressed or \
                keyboard.Key.ctrl_r in self.keys_pressed:
                 self.target_pose[2] -= self.KEY_XYZ_STEP * time_rate
+                if keyboard.Key.alt in self.keys_pressed or keyboard.Key.alt_r in self.keys_pressed:
+                    self.target_pose[2] -= (self.KEY_XYZ_STEP_FAST - self.KEY_XYZ_STEP) * time_rate
 
             # --- 旋转计算逻辑 (Rx Ry Rz) ---
 
