@@ -72,37 +72,30 @@ class GripperComm:
 
     def init_connection(self):
         # 关闭旧连接
-        print("[DEBUG] 正在关闭旧的Modbus连接...")
         for i in range(1, 5):
             req = ModbusClose.Request()
             req.index = i
             self.wrapper.call_service(self.wrapper.cli_modbus_close, req)
-
+        
         # 创建连接
-        print("[DEBUG] 正在创建新的Modbus连接...")
         req = ModbusCreate.Request()
         req.ip = "127.0.0.1"
         req.port = 60000
         req.slave_id = 1
         req.is_rtu = 1
         res = self.wrapper.call_service(self.wrapper.cli_modbus_create, req)
-
-        print(f"[DEBUG] ModbusCreate 响应: res={res}, res.res={res.res if res else 'None'}, res.index={res.index if res else 'None'}")
-
+        
         if res and res.res == 0:
             match = re.search(r'(\d+)', str(res.index))
             self.id = int(match.group(1)) if match else int(res.index)
-            print(f"[SUCCESS] Gripper Connected, ID: {self.id}")
+            print(f"Gripper Connected, ID: {self.id}")
         else:
-            print(f"[ERROR] Gripper ModbusCreate Failed! Response: {res}")
+            print(":( Gripper ModbusCreate Failed")
             self.id = 0
-
+        
         if self.id > 0:
-            print("[DEBUG] 初始化夹爪寄存器...")
             self.write_reg(256, 1, "1", wait=True) # Enable
-            print("[DEBUG] 寄存器256 (Enable) = 1")
             self.write_reg(257, 1, "60", wait=True) # Force/Speed
-            print("[DEBUG] 寄存器257 (Force/Speed) = 60")
 
     def write_reg(self, addr, count, val_str, wait=False):
         if self.id <= 0: return
@@ -110,7 +103,7 @@ class GripperComm:
         req.index = self.id
         req.addr = addr
         req.count = count
-        req.val_tab = val_str  # 保持字符串类型（ROS消息定义要求）
+        req.val_tab = val_str
         if wait:
             self.wrapper.call_service(self.wrapper.cli_set_hold_regs, req)
         else:
