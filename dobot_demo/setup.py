@@ -23,9 +23,9 @@ setup(
         'demo = dobot_demo.demo:main',
         'keyboard_control = dobot_demo.keyboard_control:main',
         'enhanced_keyboard_control = dobot_demo.enhanced_keyboard_control:main',
-        'recorder = dobot_demo.recorder:main',
-        'player = dobot_demo.player:main',
-        'player_simple = dobot_demo.player_simple:main',
+        # 'recorder = dobot_demo.recorder:main',
+        # 'player = dobot_demo.player:main',
+        # 'player_simple = dobot_demo.player_simple:main',
         ],
     },
 )
