@@ -260,6 +260,48 @@ class DataPlayer(Node):
         rclpy.spin_until_future_complete(self, speed_future, timeout_sec=2.0)
         self.get_logger().info("✓ Speed factor set to 100%")
     
+    def quaternion_to_euler(self, qx, qy, qz, qw):
+        """
+        将四元数转换为欧拉角（ZYX顺序，即Yaw-Pitch-Roll）
+        
+        参数:
+            qx, qy, qz, qw: 四元数分量
+        
+        返回:
+            tuple: (rx, ry, rz) 欧拉角，单位：度
+                   rx - 绕X轴旋转角（Roll）
+                   ry - 绕Y轴旋转角（Pitch）
+                   rz - 绕Z轴旋转角（Yaw）
+        
+        说明:
+            使用ZYX欧拉角顺序（外旋），这是DOBOT机器人常用的表示方式
+            转换公式来源于标准的四元数到欧拉角转换算法
+        """
+        # 计算旋转矩阵的各个元素（用于欧拉角提取）
+        # Roll (rx) - 绕X轴旋转
+        sinr_cosp = 2.0 * (qw * qx + qy * qz)
+        cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+        rx = np.arctan2(sinr_cosp, cosr_cosp)
+        
+        # Pitch (ry) - 绕Y轴旋转
+        sinp = 2.0 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1:
+            ry = np.copysign(np.pi / 2, sinp)  # 使用90度，处理万向节锁
+        else:
+            ry = np.arcsin(sinp)
+        
+        # Yaw (rz) - 绕Z轴旋转
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        rz = np.arctan2(siny_cosp, cosy_cosp)
+        
+        # 转换为角度（DOBOT API使用角度制）
+        rx_deg = np.rad2deg(rx)
+        ry_deg = np.rad2deg(ry)
+        rz_deg = np.rad2deg(rz)
+        
+        return rx_deg, ry_deg, rz_deg
+    
     def send_cartesian_command(self, ee_pose):
         """
         发送笛卡尔空间位姿指令（ServoP - 平滑控制）
@@ -275,14 +317,12 @@ class DataPlayer(Node):
         # 提取位置（已经是mm单位）
         x, y, z = ee_pose[0] * 1000, ee_pose[1] * 1000, ee_pose[2] * 1000  # 米转毫米
         
-        # 从四元数转换为欧拉角（简化版本，假设录制时使用欧拉角）
-        # 注意：这里需要根据实际录制时的姿态表示方式调整
-        # 如果录制时ee_pose后4位是欧拉角，直接使用；如果是四元数，需要转换
+        # 从四元数转换为欧拉角
+        # ee_pose存储格式: [x, y, z, qx, qy, qz, qw]
         qx, qy, qz, qw = ee_pose[3:7]
         
-        # 简化处理：假设录制时的姿态变化不大，使用固定姿态或零姿态
-        # TODO: 如果需要完整姿态跟踪，需要实现四元数到欧拉角的转换
-        rx, ry, rz = 180.0, 0.0, 0.0  # 默认姿态（垂直向下）
+        # 使用quaternion_to_euler方法进行转换
+        rx, ry, rz = self.quaternion_to_euler(qx, qy, qz, qw)
         
         request = ServoP.Request()
         request.x = float(x)
