@@ -215,12 +215,15 @@ class DobotApiDashboard(DobotApi):
         return self.sendRecvMsg(string)
 
     def SetHoldRegs(self, id, addr, count, table, type=None):
+        # 修复：ROS消息定义要求table是字符串，但格式化需要整数
+        table_int = int(table) if isinstance(table, str) else table
+
         if type is not None:
           string = "SetHoldRegs({:d},{:d},{:d},{:d},{:s})".format(
-            id, addr, count, table, type)
+            id, addr, count, table_int, type)
         else:
           string = "SetHoldRegs({:d},{:d},{:d},{:d})".format(
-            id, addr, count, table)
+            id, addr, count, table_int)
         return self.sendRecvMsg(string)
 
     def GetErrorID(self):

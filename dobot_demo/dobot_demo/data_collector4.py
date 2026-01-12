@@ -262,43 +262,31 @@ class GripperComm:
         self.init_connection()
 
     def init_connection(self):
-        """
-        初始化夹爪 Modbus 连接
-
-        步骤：
-        ----
-        1. 关闭所有旧连接（索引 1-4），防止端口占用
-        2. 创建新的 Modbus RTU 连接
-        3. 解析连接 ID（兼容字符串和整数返回值）
-        4. 写入初始化指令：使能 + 设置默认力度
-        """
-        # 1. 关闭旧连接（防止端口占用）
+        # 关闭旧连接
         for i in range(1, 5):
             req = ModbusClose.Request()
             req.index = i
             self.wrapper.call_service(self.wrapper.cli_modbus_close, req)
-
-        # 2. 创建 Modbus 连接
+        
+        # 创建连接
         req = ModbusCreate.Request()
         req.ip = "127.0.0.1"      # 本地回环地址
         req.port = 60000           # DOBOT Modbus 端口
         req.slave_id = 1           # 夹爪从机地址
         req.is_rtu = 1             # RTU 模式
         res = self.wrapper.call_service(self.wrapper.cli_modbus_create, req)
-
-        # 3. 解析连接 ID（兼容不同返回格式）
+        
         if res and res.res == 0:
             match = re.search(r'(\d+)', str(res.index))
             self.id = int(match.group(1)) if match else int(res.index)
-            print(f"Gripper Connected, ID: {self.id}")
+            print(f"[SUCCESS] Gripper Connected, ID: {self.id}")
         else:
-            print(":( Gripper ModbusCreate Failed")
+            print(f"[ERROR] Gripper ModbusCreate Failed! Response: {res}")
             self.id = 0
-
-        # 4. 初始化夹爪
+        
         if self.id > 0:
-            self.write_reg(256, 1, "1", wait=True)   # 使能夹爪
-            self.write_reg(257, 1, "60", wait=True)  # 设置力度 60%
+            self.write_reg(256, 1, "1", wait=True) # Enable
+            self.write_reg(257, 1, "60", wait=True) # Force/Speed
 
     def write_reg(self, addr, count, val_str, wait=False):
         """
@@ -316,7 +304,7 @@ class GripperComm:
         req.index = self.id
         req.addr = addr
         req.count = count
-        req.val_tab = val_str
+        req.val_tab = val_str  # 保持字符串类型（ROS消息定义要求）
         if wait:
             self.wrapper.call_service(self.wrapper.cli_set_hold_regs, req)
         else:
@@ -950,11 +938,14 @@ class TeleopController:
         """
         if self.vgrab_state != 0:
             return
-
+            
+        # 更新共享状态，供 GripperManager 读取
         if button == mouse.Button.left:
             self.mouse_state.left_pressed = pressed
+            print(f"[DEBUG] 左键 {'按下' if pressed else '松开'}")
         elif button == mouse.Button.right:
             self.mouse_state.right_pressed = pressed
+            print(f"[DEBUG] 右键 {'按下' if pressed else '松开'}")
 
     def _on_scroll(self, x, y, dx, dy):
         """
