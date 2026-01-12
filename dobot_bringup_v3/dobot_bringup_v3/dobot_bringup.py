@@ -55,8 +55,8 @@ class adderServer(Node):
         self.srv = self.create_service(SpeedFactor,'/dobot_bringup_v3/srv/SpeedFactor',self.SpeedFactor)
         self.srv = self.create_service(SpeedJ,'/dobot_bringup_v3/srv/SpeedJ',self.SpeedJ)
         self.srv = self.create_service(SpeedL,'/dobot_bringup_v3/srv/SpeedL',self.SpeedL)
-        # self.srv = self.create_service(StartDrag,'/dobot_bringup_v3/srv/StartDrag',self.StartDrag)
-        # self.srv = self.create_service(StopDrag,'/dobot_bringup_v3/srv/StopDrag',self.StopDrag)
+        self.srv = self.create_service(StartDrag,'/dobot_bringup_v3/srv/StartDrag',self.StartDrag)
+        self.srv = self.create_service(StopDrag,'/dobot_bringup_v3/srv/StopDrag',self.StopDrag)
         # self.srv = self.create_service(StopScript,'/dobot_bringup_v3/srv/StopScript',self.StopScript)
         self.srv = self.create_service(Tool,'/dobot_bringup_v3/srv/Tool',self.Tool)
         self.srv = self.create_service(ToolDI,'/dobot_bringup_v3/srv/ToolDI',self.ToolDI)
@@ -410,6 +410,21 @@ class adderServer(Node):
         response.res = int(return_tt)                                           
         self.get_logger().info(return_t)                                     
         return response 
+    def StartDrag(self, request, response):
+        # 调用 API 接口进入拖拽模式
+        return_t = self.dashboard.StartDrag()
+        # 按照该项目统一的解析逻辑提取 ErrorID
+        return_tt = return_t[:return_t.find("{")-1]
+        response.res = int(return_tt)                                           
+        self.get_logger().info(return_t)
+        return response
+    def StopDrag(self, request, response):
+        # 调用 API 接口退出拖拽模式
+        return_t = self.dashboard.StopDrag()
+        return_tt = return_t[:return_t.find("{")-1]
+        response.res = int(return_tt)                                           
+        self.get_logger().info(return_t)
+        return response
 
 
 def main(args=None):                                 # ROS2节点主入口main函数
