@@ -5,3 +5,8 @@ dobot_bringup_v3/dobot_bringup_v3/__pycache__/feedback.cpython-310.pyc
 dobot_moveit/dobot_moveit/__pycache__/__init__.cpython-310.pyc
 dobot_moveit/dobot_moveit/__pycache__/action_move_server.cpython-310.pyc
 dobot_moveit/dobot_moveit/__pycache__/joint_states.cpython-310.pyc
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
