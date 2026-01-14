@@ -821,12 +821,12 @@ class TeleopController:
         self.gripper_worker.start()
 
         # 参数
-        self.LOOP_RATE = 100.0 
-        self.MOUSE_SENSITIVITY = 0.1
-        self.SCROLL_SENSITIVITY = 2.0
-        self.KEY_XYZ_STEP = 0.3
-        self.KEY_XYZ_STEP_FAST = 0.6
-        self.KEY_ROT_STEP = 0.3
+        self.LOOP_RATE = 100.0                      # 主控制循环频率 (Hz)，决定了 ServoP 指令发送频率
+        self.MOUSE_SENSITIVITY = 0.1                # 鼠标灵敏度系数 (mm/pixel)，控制鼠标移动转换为XY轴位移的比例
+        self.SCROLL_SENSITIVITY = 2.0               # 滚轮灵敏度系数 (deg/scroll_unit)，控制滚轮转换为Rz旋转的比例
+        self.KEY_XYZ_STEP = 0.3                     # 键盘控制Z轴的单步长度 (mm/tick)，按Space/Ctrl时的移动速度
+        self.KEY_XYZ_STEP_FAST = 0.6                # 键盘控制Z轴的加速步长 (mm/tick)，按Alt+Space/Ctrl时的移动速度（双倍）
+        self.KEY_ROT_STEP = 0.3                     # 键盘控制姿态旋转的单步长度 (deg/tick)，按WASD键时的旋转速度
 
         # [新增] 垂直抓取 (Vertical Grab) 参数
         # 请根据实际环境修改这些值！
