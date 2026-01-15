@@ -281,6 +281,7 @@ class GripperStateFeedback(threading.Thread):
     """
     [新增] 独立的夹爪状态反馈线程
     专门负责定期读取夹爪实际位置并发布当前状态和目标状态
+    使用高频发布(100Hz)+低频采样(10Hz)+基于时间的线性插补
     """
     def __init__(self, wrapper, comm, gripper_manager, controller):
         super().__init__(daemon=True)
@@ -289,39 +290,116 @@ class GripperStateFeedback(threading.Thread):
         self.gripper_manager = gripper_manager
         self.controller = controller  # 引用主控制器，用于检查 control_enabled
         self.running = True
-        self.feedback_rate = 10.0  # Hz - 状态反馈频率
+
+        # 频率设置
+        self.feedback_rate = 100.0  # 发布频率 100Hz（参考 joint_states.py）
+        self.modbus_read_rate = 10.0  # Modbus实际读取频率 10Hz
+        self.read_interval = 1.0 / self.modbus_read_rate  # 读取间隔 0.1秒
+
+        # 插补所需的状态变量（基于时间戳）
+        self.last_read_time = time.time()
+
+        # 当前状态插补
+        self.last_real_pos = None
+        self.current_real_pos = None
+        self.last_real_read_time = None
+        self.current_real_read_time = None
+
+        # 目标状态插补
+        self.last_target_pos = None
+        self.current_target_pos = None
+        self.last_target_read_time = None
+        self.current_target_read_time = None
+
+    def _interpolate(self, last_val, current_val, last_time, current_time, now):
+        """
+        基于时间的线性插补
+        """
+        if last_val is None or current_val is None:
+            return current_val if current_val is not None else 0.0
+
+        if last_time is None or current_time is None:
+            return current_val
+
+        # 计算插补系数
+        time_span = current_time - last_time
+        if time_span <= 0:
+            return current_val
+
+        elapsed = now - last_time
+        alpha = min(1.0, elapsed / time_span)  # 限制在 [0, 1]
+
+        # 线性插补
+        return last_val + alpha * (current_val - last_val)
 
     def run(self):
         """
-        核心循环：以固定频率发布夹爪当前状态和目标状态
+        核心循环：以100Hz频率发布夹爪状态（当前+目标），使用基于时间的线性插补
         """
         while self.running:
             try:
+                now = time.time()
                 timestamp = self.wrapper.get_clock().now().to_msg()
 
-                # 1. 读取并发布夹爪实际位置（当前状态）
-                real_pos = self.comm.read_reg(514)
-                if real_pos is not None:
-                    msg_current = PointStamped()
-                    msg_current.header.stamp = timestamp
-                    msg_current.header.frame_id = "gripper_feedback"
-                    msg_current.point.x = float(real_pos)
-                    msg_current.point.y = 0.0
-                    msg_current.point.z = 0.0
-                    self.wrapper.pub_gripper_state.publish(msg_current)
+                # === 每0.1秒读取一次真实值 ===
+                if now - self.last_read_time >= self.read_interval:
+                    self.last_read_time = now
 
-                # 2. 发布夹爪目标位置（目标状态）
-                # 如果控制禁用，目标状态 = 当前状态（跟踪实际位置）
-                # 如果控制启用，目标状态 = 控制指令
-                if not self.controller.control_enabled and real_pos is not None:
-                    target_pos = float(real_pos)  # 跟踪实际位置
-                else:
-                    target_pos = self.gripper_manager.current_pos  # 使用控制指令
+                    # 读取夹爪实际位置
+                    real_pos = self.comm.read_reg(514)
+                    if real_pos is not None:
+                        self.last_real_pos = self.current_real_pos
+                        self.last_real_read_time = self.current_real_read_time
 
+                        self.current_real_pos = float(real_pos)
+                        self.current_real_read_time = now
+
+                    # 读取目标位置
+                    if not self.controller.control_enabled and real_pos is not None:
+                        # 控制禁用时，目标=实际
+                        target = float(real_pos)
+                    else:
+                        # 控制启用时，目标=控制指令
+                        target = self.gripper_manager.current_pos
+
+                    self.last_target_pos = self.current_target_pos
+                    self.last_target_read_time = self.current_target_read_time
+
+                    self.current_target_pos = target
+                    self.current_target_read_time = now
+
+                # === 基于时间的线性插补计算 ===
+                interpolated_current = self._interpolate(
+                    self.last_real_pos,
+                    self.current_real_pos,
+                    self.last_real_read_time,
+                    self.current_real_read_time,
+                    now
+                )
+
+                interpolated_target = self._interpolate(
+                    self.last_target_pos,
+                    self.current_target_pos,
+                    self.last_target_read_time,
+                    self.current_target_read_time,
+                    now
+                )
+
+                # === 发布插补后的状态（100Hz）===
+                # 发布当前状态
+                msg_current = PointStamped()
+                msg_current.header.stamp = timestamp
+                msg_current.header.frame_id = "gripper_feedback"
+                msg_current.point.x = float(interpolated_current)
+                msg_current.point.y = 0.0
+                msg_current.point.z = 0.0
+                self.wrapper.pub_gripper_state.publish(msg_current)
+
+                # 发布目标状态
                 msg_target = PointStamped()
                 msg_target.header.stamp = timestamp
                 msg_target.header.frame_id = "gripper_command"
-                msg_target.point.x = float(target_pos)
+                msg_target.point.x = float(interpolated_target)
                 msg_target.point.y = 0.0
                 msg_target.point.z = 0.0
                 self.wrapper.pub_gripper_update.publish(msg_target)
@@ -330,7 +408,7 @@ class GripperStateFeedback(threading.Thread):
                 # 避免异常导致线程崩溃
                 print(f"[ERROR] GripperStateFeedback: {e}")
 
-            # 控制循环频率
+            # 控制循环频率 100Hz
             time.sleep(1.0 / self.feedback_rate)
 
 class SharedMouseState:
@@ -477,13 +555,14 @@ class TeleopController:
         print("=== 系统就绪 ===")
         print(" [Main Loop]       : 负责机械臂运动 (ServoP)")
         print(" [Gripper Thread]  : 负责夹爪控制")
-        print(" [Feedback Thread] : 定期发布夹爪状态 (当前+目标 @ 10Hz)")
+        print(" [Feedback Thread] : 定期发布夹爪状态 (当前+目标 @ 100Hz，基于时间的线性插补)")
         print("")
         print("=== VLA 数据采集话题 ===")
         print(" - 机械臂当前状态: /dobot_msgs_v3/msg/ToolVectorActual (100Hz)")
         print(" - 机械臂目标状态: /robot/target_pose (100Hz)")
-        print(" - 夹爪当前状态:   /gripper/state_feedback (10Hz)")
-        print(" - 夹爪目标状态:   /gripper/command_update (10Hz)")
+        print(" - 夹爪当前状态:   /gripper/state_feedback (100Hz，10Hz采样+时间插补)")
+        print(" - 夹爪目标状态:   /gripper/command_update (100Hz，10Hz采样+时间插补)")
+        print(" - 相机帧率:       30Hz（数据采集时可降采样）")
         print("")
         print(" [O/P/L]           : 录制控制")
         print(" [Z]               : 触发垂直抓取序列")
