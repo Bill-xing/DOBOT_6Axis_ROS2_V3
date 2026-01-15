@@ -10,4 +10,5 @@ data/episode_0.hdf5
 .gitignore
 data/episode_1_rgb.mp4
 .gitignore
-data/episode_1.hdf5
+data/*
+
