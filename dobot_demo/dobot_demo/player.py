@@ -107,18 +107,26 @@ class GripperComm:
         self.init_connection()
     
     def call_service(self, client, request):
-        """同步调用服务（阻塞等待结果）"""
+        """
+        同步调用服务（阻塞等待结果）
+        
+        说明:
+            使用忙等待（busy-wait）直到服务返回结果
+            与data_collector4.py保持一致，但添加超时保护
+        """
         if not client.service_is_ready():
             return None
         future = client.call_async(request)
-        # Use rclpy.spin_until_future_complete with timeout to avoid busy-wait
-        timeout_sec = 5.0
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=timeout_sec)
-        if future.done():
-            return future.result()
-        else:
-            self.node.get_logger().warn(f"Service call timed out after {timeout_sec}s")
-            return None
+        # 添加超时保护，避免无限等待
+        timeout_count = 0
+        max_timeout_ms = 5000  # 5秒超时
+        while not future.done():
+            time.sleep(0.001)  # 1ms 轮询间隔
+            timeout_count += 1
+            if timeout_count >= max_timeout_ms:
+                self.node.get_logger().warn(f"Service call timed out after {max_timeout_ms}ms")
+                return None
+        return future.result()
     
     def call_service_async_no_wait(self, client, request):
         """异步调用服务（非阻塞，不等待结果）"""
@@ -147,7 +155,10 @@ class GripperComm:
             # Use regex to ensure we get the numeric value
             try:
                 match = re.search(r'(\d+)', str(res.index))
-                self.id = int(match.group(1)) if match else int(res.index)
+                if match:
+                    self.id = int(match.group(1))
+                else:
+                    self.id = int(res.index)
                 self.node.get_logger().info(f"✓ Gripper connected, Modbus ID: {self.id}")
             except (ValueError, TypeError, AttributeError) as e:
                 self.node.get_logger().error(f"✗ Failed to parse Modbus ID from response: {e}")
@@ -209,8 +220,9 @@ class GripperComm:
         if res and res.res == 0 and res.value is not None:
             try:
                 return int(res.value)
-            except (ValueError, TypeError, AttributeError) as e:
-                self.node.get_logger().warn(f"Failed to parse register value: {e}")
+            except (ValueError, TypeError):
+                # Silently fail and return None, consistent with data_collector4.py
+                pass
         return None
 
 class DataPlayer(Node):
@@ -556,6 +568,8 @@ class DataPlayer(Node):
             if len(gripper_pos) > 0:
                 pos_normalized = float(gripper_pos[0])
             else:
+                # 空数组通常表示数据问题，记录警告
+                self.get_logger().warn("Received empty gripper_pos array, defaulting to 0.0 (closed)")
                 pos_normalized = 0.0
         else:
             pos_normalized = float(gripper_pos)
