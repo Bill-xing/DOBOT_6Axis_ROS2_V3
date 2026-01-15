@@ -82,8 +82,9 @@ class DataRecorder(Node):
                                                            self.gripper_target_callback, sensor_qos)
 
         self.get_logger().info("=== VLA Data Recorder Initialized (Manual Time Alignment) ===")
-        self.get_logger().info("Time synchronization: Manual matching with 50ms tolerance")
+        self.get_logger().info("Time synchronization: Linear interpolation (no image dropping)")
         self.get_logger().info("QoS: BEST_EFFORT + VOLATILE")
+        self.get_logger().info("Strategy: Keep all camera frames, interpolate robot/gripper states")
         self.get_logger().info("Press 'O' to start recording.")
 
         # 调试定时器
@@ -172,7 +173,7 @@ class DataRecorder(Node):
             self.msg_count[key] = 0
 
     def find_closest_msg(self, buffer, target_time, tolerance=0.05):
-        """在缓冲区中查找时间戳最接近目标时间的消息"""
+        """在缓冲区中查找时间戳最接近目标时间的消息（用于向后兼容）"""
         if not buffer:
             return None
 
@@ -187,20 +188,103 @@ class DataRecorder(Node):
 
         return best_match
 
+    def interpolate_state(self, buffer, target_time, state_dim):
+        """
+        对状态数据进行线性插值
+
+        参数:
+        - buffer: 消息缓冲队列 [(timestamp, msg), ...]
+        - target_time: 目标时间戳
+        - state_dim: 状态维度（用于提取状态向量）
+
+        返回: 插值后的状态 numpy array 或 None
+        """
+        if len(buffer) < 2:
+            # 如果缓冲区少于2个数据点，使用最近的
+            if buffer:
+                return self.find_closest_msg(buffer, target_time, tolerance=1.0)
+            return None
+
+        # 转换为列表以便索引
+        buffer_list = list(buffer)
+
+        # 找到目标时间前后的两个数据点
+        before_idx = None
+        after_idx = None
+
+        for i, (ts, msg) in enumerate(buffer_list):
+            if ts <= target_time:
+                before_idx = i
+            if ts >= target_time and after_idx is None:
+                after_idx = i
+                break
+
+        # 情况1: 目标时间在缓冲区范围之前
+        if before_idx is None:
+            return (buffer_list[0][0], buffer_list[0][1])
+
+        # 情况2: 目标时间在缓冲区范围之后
+        if after_idx is None:
+            return (buffer_list[-1][0], buffer_list[-1][1])
+
+        # 情况3: 找到前后两个点，进行线性插值
+        t_before, msg_before = buffer_list[before_idx]
+        t_after, msg_after = buffer_list[after_idx]
+
+        # 如果前后是同一个点（时间戳完全匹配）
+        if t_before == t_after:
+            return (t_before, msg_before)
+
+        # 计算插值权重
+        alpha = (target_time - t_before) / (t_after - t_before)
+        alpha = max(0.0, min(1.0, alpha))  # 限制在 [0, 1]
+
+        # 根据消息类型进行插值
+        if state_dim == 6:  # ToolVectorActual (x, y, z, rx, ry, rz)
+            state_before = np.array([msg_before.x, msg_before.y, msg_before.z,
+                                    msg_before.rx, msg_before.ry, msg_before.rz], dtype=np.float32)
+            state_after = np.array([msg_after.x, msg_after.y, msg_after.z,
+                                   msg_after.rx, msg_after.ry, msg_after.rz], dtype=np.float32)
+            interpolated = state_before * (1 - alpha) + state_after * alpha
+
+            # 创建插值后的消息（用于后续处理）
+            class InterpolatedMsg:
+                def __init__(self, state):
+                    self.x, self.y, self.z, self.rx, self.ry, self.rz = state
+
+            return (target_time, InterpolatedMsg(interpolated))
+
+        elif state_dim == 1:  # PointStamped (gripper position)
+            val_before = msg_before.point.x
+            val_after = msg_after.point.x
+            interpolated_val = val_before * (1 - alpha) + val_after * alpha
+
+            class InterpolatedMsg:
+                def __init__(self, val):
+                    self.point = type('obj', (object,), {'x': val})()
+
+            return (target_time, InterpolatedMsg(interpolated_val))
+
+        return None
+
     def try_align_and_record(self, reference_time):
-        """尝试对齐所有传感器数据并录制"""
+        """
+        尝试对齐所有传感器数据并录制
+
+        策略：保留所有相机图像，对机械臂和夹爪状态进行线性插值
+        """
         with self.mutex:
-            tolerance = 0.05  # 50ms
+            # 使用线性插值获取状态（不丢弃图像）
+            color_match = self.find_closest_msg(self.msg_buffer['color'], reference_time, tolerance=1.0)
+            depth_match = self.find_closest_msg(self.msg_buffer['depth'], reference_time, tolerance=1.0)
 
-            # 查找与参考时间最接近的消息
-            color_match = self.find_closest_msg(self.msg_buffer['color'], reference_time, tolerance)
-            depth_match = self.find_closest_msg(self.msg_buffer['depth'], reference_time, tolerance)
-            robot_current_match = self.find_closest_msg(self.msg_buffer['robot_current'], reference_time, tolerance)
-            robot_target_match = self.find_closest_msg(self.msg_buffer['robot_target'], reference_time, tolerance)
-            gripper_current_match = self.find_closest_msg(self.msg_buffer['gripper_current'], reference_time, tolerance)
-            gripper_target_match = self.find_closest_msg(self.msg_buffer['gripper_target'], reference_time, tolerance)
+            # 对机械臂和夹爪状态进行线性插值
+            robot_current_match = self.interpolate_state(self.msg_buffer['robot_current'], reference_time, state_dim=6)
+            robot_target_match = self.interpolate_state(self.msg_buffer['robot_target'], reference_time, state_dim=6)
+            gripper_current_match = self.interpolate_state(self.msg_buffer['gripper_current'], reference_time, state_dim=1)
+            gripper_target_match = self.interpolate_state(self.msg_buffer['gripper_target'], reference_time, state_dim=1)
 
-            # 检查必要数据是否存在
+            # 检查必要数据是否存在（只要有图像和插值状态就录制）
             if not all([color_match, robot_current_match, robot_target_match,
                        gripper_current_match, gripper_target_match]):
                 return
@@ -318,8 +402,8 @@ class DataRecorder(Node):
                 # 元数据
                 f.attrs['sim'] = False
                 f.attrs['total_frames'] = data_len
-                f.attrs['sync_method'] = 'ManualTimeAlignment'
-                f.attrs['sync_tolerance_ms'] = 50.0
+                f.attrs['sync_method'] = 'LinearInterpolation'
+                f.attrs['sync_strategy'] = 'keep_all_images_interpolate_states'
                 f.attrs['camera_frequency_hz'] = 30
                 f.attrs['robot_frequency_hz'] = 100
 

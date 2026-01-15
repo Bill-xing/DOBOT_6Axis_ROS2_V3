@@ -8,3 +8,6 @@ dobot_moveit/dobot_moveit/__pycache__/joint_states.cpython-310.pyc
 data/episode_0_rgb.mp4
 data/episode_0.hdf5
 .gitignore
+data/episode_1_rgb.mp4
+.gitignore
+data/episode_1.hdf5
