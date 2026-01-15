@@ -112,7 +112,8 @@ class GripperComm:
         
         说明:
             使用忙等待（busy-wait）直到服务返回结果
-            与data_collector4.py保持一致，但添加超时保护
+            与data_collector4.py保持一致的实现方式
+            这种方式在Modbus通信场景下更可靠，避免ROS2节点循环干扰
         """
         if not client.service_is_ready():
             return None
@@ -121,7 +122,7 @@ class GripperComm:
         timeout_count = 0
         max_timeout_ms = 5000  # 5秒超时
         while not future.done():
-            time.sleep(0.001)  # 1ms 轮询间隔
+            time.sleep(0.001)  # 1ms 轮询间隔（保持与data_collector4.py一致）
             timeout_count += 1
             if timeout_count >= max_timeout_ms:
                 self.node.get_logger().warn(f"Service call timed out after {max_timeout_ms}ms")
@@ -135,7 +136,8 @@ class GripperComm:
     
     def init_connection(self):
         """初始化 Modbus 连接"""
-        # 关闭旧连接
+        # 关闭旧连接（清理可能存在的残留连接，索引1-4为常用范围）
+        # 与data_collector4.py保持一致的清理策略
         for i in range(1, 5):
             req = ModbusClose.Request()
             req.index = i
@@ -151,8 +153,9 @@ class GripperComm:
         
         if res and res.res == 0:
             # Extract Modbus connection ID from response
-            # The response index may be a string like "index: 1" or direct integer
-            # Use regex to ensure we get the numeric value
+            # The response index format varies (may be "index: 1" string or integer)
+            # Using regex ensures robust parsing across different response formats
+            # This pattern is consistent with data_collector4.py
             try:
                 match = re.search(r'(\d+)', str(res.index))
                 if match:
@@ -221,7 +224,9 @@ class GripperComm:
             try:
                 return int(res.value)
             except (ValueError, TypeError):
-                # Silently fail and return None, consistent with data_collector4.py
+                # Silent failure consistent with data_collector4.py
+                # Parsing errors are expected in some edge cases (e.g., hardware not responding)
+                # Debug: uncomment to troubleshoot - self.node.get_logger().debug(f"Failed to parse register value: {res.value}")
                 pass
         return None
 
