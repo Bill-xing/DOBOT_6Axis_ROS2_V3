@@ -361,18 +361,19 @@ class TeleopController:
         self.vgrab_state = 0    # 0=Idle, 1=Descending, 2=Ascending+Closing
 
         self.running = True
+        self.control_enabled = True  # 新增：控制启用/禁用标志
         self.target_pose = [0.0] * 6
         self.keys_pressed = set()
         
         self._init_pose()
         
-        # 输入监听
-        self.kb_listener = keyboard.Listener(on_press=self._on_key_press, on_release=self._on_key_release, suppress=True)
+        # 输入监听（suppress改为False，允许其他程序接收输入）
+        self.kb_listener = keyboard.Listener(on_press=self._on_key_press, on_release=self._on_key_release, suppress=False)
         self.mouse_listener = mouse.Listener(
-            on_move=self._on_mouse_move, 
-            on_click=self._on_mouse_click, 
+            on_move=self._on_mouse_move,
+            on_click=self._on_mouse_click,
             on_scroll=self._on_scroll,
-            suppress=True
+            suppress=False
         )
         self.kb_listener.start()
         self.mouse_listener.start()
@@ -394,6 +395,7 @@ class TeleopController:
         print(" [Gripper Thread]: 负责夹爪控制与回读")
         print(" [O/P/L]        : 录制控制")
         print(" [Z]            : 触发垂直抓取序列")
+        print(" [Tab]          : 暂停/恢复控制（可操作其他窗口）")
 
     def _init_pose(self):
         for _ in range(5):
@@ -410,6 +412,8 @@ class TeleopController:
 
     # --- 输入回调 (运行在 pynput 线程) ---
     def _on_mouse_move(self, x, y):
+        if not self.control_enabled:
+            return
         dx = x - self.center_x
         dy = y - self.center_y
         if dx != 0 or dy != 0:
@@ -417,6 +421,8 @@ class TeleopController:
             self.mouse_controller.position = (self.center_x, self.center_y)
 
     def _on_mouse_click(self, x, y, button, pressed):
+        if not self.control_enabled:
+            return
         # 如果正在自动抓取，忽略鼠标点击
         if self.vgrab_state != 0:
             return
@@ -430,21 +436,31 @@ class TeleopController:
             print(f"[DEBUG] 右键 {'按下' if pressed else '松开'}")
 
     def _on_scroll(self, x, y, dx, dy):
+        if not self.control_enabled:
+            return
         self.mouse_state.update_scroll(dy)
 
     def _on_key_press(self, key):
         if key == keyboard.Key.esc: self.running = False
+
+        # Tab键切换控制启用/禁用
+        if key == keyboard.Key.tab:
+            self.control_enabled = not self.control_enabled
+            status = "启用" if self.control_enabled else "禁用"
+            print(f"\n>>> 控制已{status}，现在可以操作其他窗口\n")
+            return
+
         try:
             if hasattr(key, 'char'):
                 char_key = key.char.lower()
                 self.keys_pressed.add(char_key)
-                
+
                 # 录制指令
                 msg = Int32()
                 if char_key == 'o': msg.data = 1; self.robot.node.pub_record_cmd.publish(msg); print("Rec Start")
                 elif char_key == 'p': msg.data = 2; self.robot.node.pub_record_cmd.publish(msg); print("Rec Save")
                 elif char_key == 'l': msg.data = 0; self.robot.node.pub_record_cmd.publish(msg); print("Rec Discard")
-                
+
                 # [新增] Z键触发垂直抓取
                 elif char_key == 'z':
                     print(">>> 开始垂直抓取序列")
@@ -465,10 +481,15 @@ class TeleopController:
     # --- 主循环 (Main Process) ---
     def run(self):
         time_rate = 1.0
-        
+
         while self.running:
             start_time = time.time()
-            
+
+            # 如果控制被禁用，跳过所有控制逻辑
+            if not self.control_enabled:
+                time.sleep(0.01)
+                continue
+
             # [新增] 垂直抓取状态机
             if self.vgrab_state != 0:
                 if 'x' in self.keys_pressed:
