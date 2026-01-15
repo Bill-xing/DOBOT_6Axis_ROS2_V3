@@ -102,7 +102,7 @@ class GripperComm:
             self.write_reg(256, 1, "1", wait=True) # Enable
             print("[DEBUG] 寄存器256 (Enable) = 1")
             self.write_reg(257, 1, "60", wait=True) # Force/Speed
-            print("[DEBUG] 寄存器257 (Force/Speed) = 60")
+            print("[DEBUG] 寄存器257 (Force/Speed) = 100")
 
     def write_reg(self, addr, count, val_str, wait=False):
         if self.id <= 0: return
