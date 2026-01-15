@@ -50,8 +50,156 @@ from cv_bridge import CvBridge
 # ROS消息类型
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String, Float32
-from dobot_msgs_v3.srv import EnableRobot, ServoJ, ServoP, SpeedFactor
+from dobot_msgs_v3.srv import EnableRobot, ServoJ, ServoP, SpeedFactor, ModbusCreate, ModbusClose, SetHoldRegs, GetHoldRegs
 from scipy.interpolate import interp1d
+import re
+
+class GripperComm:
+    """
+    ============================================================================
+    DH-Robotics AG 系列夹爪 Modbus-RTU 通信类
+    ============================================================================
+    
+    功能说明：
+    ---------
+    - 负责底层 Modbus 协议通信，用于控制夹爪
+    - 通过 DOBOT 控制器的 Modbus 服务转发指令
+    - 支持寄存器读写操作
+    
+    关键寄存器地址（十六进制 -> 十进制）：
+    ---------------------------------------
+    0x0100 (256)  - 初始化寄存器（写1=初始化）
+    0x0101 (257)  - 力度/速度设置（20-100%）
+    0x0103 (259)  - 位置控制（0-1000，0=闭合，1000=张开）
+    0x0201 (513)  - 运动状态（0=运动中, 1=到位, 2=夹持, 3=掉落）
+    0x0202 (514)  - 实时位置反馈（0-1000）
+    
+    连接参数：
+    ---------
+    - IP: 127.0.0.1（本地回环，通过 DOBOT 控制器转发）
+    - Port: 60000
+    - Slave ID: 1
+    - Mode: RTU (is_rtu=1)
+    ============================================================================
+    """
+    def __init__(self, node):
+        """
+        初始化夹爪通信
+        
+        参数:
+            node: ROS2 节点实例，用于调用服务
+        """
+        self.node = node
+        self.id = 0  # Modbus 连接 ID（由 ModbusCreate 返回）
+        
+        # 创建服务客户端
+        self.cli_modbus_create = node.create_client(ModbusCreate, '/dobot_bringup_v3/srv/ModbusCreate')
+        self.cli_modbus_close = node.create_client(ModbusClose, '/dobot_bringup_v3/srv/ModbusClose')
+        self.cli_set_hold_regs = node.create_client(SetHoldRegs, '/dobot_bringup_v3/srv/SetHoldRegs')
+        self.cli_get_hold_regs = node.create_client(GetHoldRegs, '/dobot_bringup_v3/srv/GetHoldRegs')
+        
+        # 等待服务可用
+        node.get_logger().info("Waiting for Modbus services...")
+        if not self.cli_modbus_create.wait_for_service(timeout_sec=2.0):
+            node.get_logger().warn("Modbus services not available, gripper control disabled")
+            return
+            
+        self.init_connection()
+    
+    def call_service(self, client, request):
+        """同步调用服务（阻塞等待结果）"""
+        if not client.service_is_ready():
+            return None
+        future = client.call_async(request)
+        while not future.done():
+            time.sleep(0.001)
+        return future.result()
+    
+    def call_service_async_no_wait(self, client, request):
+        """异步调用服务（非阻塞，不等待结果）"""
+        if client.service_is_ready():
+            client.call_async(request)
+    
+    def init_connection(self):
+        """初始化 Modbus 连接"""
+        # 关闭旧连接
+        for i in range(1, 5):
+            req = ModbusClose.Request()
+            req.index = i
+            self.call_service(self.cli_modbus_close, req)
+        
+        # 创建新连接
+        req = ModbusCreate.Request()
+        req.ip = "127.0.0.1"      # 本地回环地址
+        req.port = 60000           # DOBOT Modbus 端口
+        req.slave_id = 1           # 夹爪从机地址
+        req.is_rtu = 1             # RTU 模式
+        res = self.call_service(self.cli_modbus_create, req)
+        
+        if res and res.res == 0:
+            match = re.search(r'(\d+)', str(res.index))
+            self.id = int(match.group(1)) if match else int(res.index)
+            self.node.get_logger().info(f"✓ Gripper connected, Modbus ID: {self.id}")
+        else:
+            self.node.get_logger().error(f"✗ Gripper connection failed! Response: {res}")
+            self.id = 0
+            return
+        
+        # 初始化夹爪
+        if self.id > 0:
+            self.write_reg(256, 1, "1", wait=True)  # Enable
+            self.write_reg(257, 1, "60", wait=True) # Force/Speed: 60%
+            self.node.get_logger().info("✓ Gripper initialized")
+    
+    def write_reg(self, addr, count, val_str, wait=False):
+        """
+        写入保持寄存器
+        
+        参数:
+            addr: 寄存器地址（十进制）
+            count: 寄存器数量（通常为1）
+            val_str: 要写入的值（字符串格式）
+            wait: 是否等待写入完成（True=阻塞，False=非阻塞）
+        """
+        if self.id <= 0:
+            return
+        
+        req = SetHoldRegs.Request()
+        req.index = self.id
+        req.addr = addr
+        req.count = count
+        req.val_tab = val_str
+        
+        if wait:
+            self.call_service(self.cli_set_hold_regs, req)
+        else:
+            self.call_service_async_no_wait(self.cli_set_hold_regs, req)
+    
+    def read_reg(self, addr):
+        """
+        读取保持寄存器
+        
+        参数:
+            addr: 寄存器地址（十进制）
+        
+        返回:
+            寄存器值（整数），失败时返回 None
+        """
+        if self.id <= 0:
+            return None
+        
+        req = GetHoldRegs.Request()
+        req.index = self.id
+        req.addr = addr
+        req.count = 1
+        res = self.call_service(self.cli_get_hold_regs, req)
+        
+        if res and res.res == 0:
+            try:
+                return int(res.value)
+            except:
+                pass
+        return None
 
 class DataPlayer(Node):
     """
@@ -123,6 +271,18 @@ class DataPlayer(Node):
             self.get_logger().info('ServoP service not available, waiting...')
         
         self.get_logger().info("✓ All services connected")
+        
+        # ========== 夹爪初始化 ==========
+        self.gripper_comm = None
+        try:
+            self.gripper_comm = GripperComm(self)
+            if self.gripper_comm.id > 0:
+                self.get_logger().info("✓ Gripper communication initialized")
+            else:
+                self.get_logger().warn("Gripper communication failed, playback will continue without gripper control")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to initialize gripper: {e}")
+            self.gripper_comm = None
         
         # ========== 使能机械臂 ==========
         self.enable_robot()
@@ -362,6 +522,39 @@ class DataPlayer(Node):
         # 可选：如果需要确认命令已执行，取消注释下面的行
         # rclpy.spin_until_future_complete(self, future, timeout_sec=0.1)
     
+    def send_gripper_command(self, gripper_pos):
+        """
+        发送夹爪位置指令
+        
+        参数:
+            gripper_pos (float or np.ndarray): 夹爪位置（0-1范围，0=闭合，1=张开）
+                                                 或 (1,) 形状的数组
+        
+        说明:
+            - 将标准化的夹爪位置（0-1）映射到实际硬件范围（0-1000）
+            - 使用异步非阻塞调用，确保高频率控制不受影响
+            - 如果夹爪未初始化，静默跳过（不影响机械臂运动）
+        """
+        # 检查夹爪是否可用
+        if self.gripper_comm is None or self.gripper_comm.id <= 0:
+            return
+        
+        # 处理输入格式（可能是标量或数组）
+        if isinstance(gripper_pos, np.ndarray):
+            pos_normalized = float(gripper_pos[0]) if len(gripper_pos) > 0 else 0.0
+        else:
+            pos_normalized = float(gripper_pos)
+        
+        # 限制范围到 [0, 1]
+        pos_normalized = np.clip(pos_normalized, 0.0, 1.0)
+        
+        # 映射到硬件范围 [0, 1000]
+        # 注意：0=闭合，1000=张开
+        hardware_pos = int(pos_normalized * 1000)
+        
+        # 发送非阻塞指令到寄存器 259（位置控制）
+        self.gripper_comm.write_reg(259, 1, str(hardware_pos), wait=False)
+    
     def publish_image(self, frame_idx):
         """发布当前帧的图像（用于可视化）"""
         if not self.enable_visualization or 'images' not in self.trajectory_data:
@@ -435,9 +628,8 @@ class DataPlayer(Node):
                     # 发送笛卡尔空间指令（ServoP，平滑控制）
                     self.send_cartesian_command(ee_pose)
                     
-                    # TODO: 发送夹爪指令（需要根据实际夹爪接口实现）
-                    # 参考data_collector4的GripperManager实现
-                    # self.send_gripper_command(gripper_pos)
+                    # 发送夹爪指令
+                    self.send_gripper_command(gripper_pos)
                     
                     # 发布可视化和状态（降低频率避免过载）
                     if i % 10 == 0:  # 每10帧发布一次（10Hz）
