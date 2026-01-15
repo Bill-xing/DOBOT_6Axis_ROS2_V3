@@ -40,7 +40,10 @@ class DobotRosWrapper(Node):
 
         # 使用 PointStamped 发布夹爪状态（x字段存数值，header存时间戳）
         self.pub_gripper_update = self.create_publisher(PointStamped, "/gripper/command_update", 5)
-        
+
+        # [新增] 发布夹爪实际状态反馈
+        self.pub_gripper_state = self.create_publisher(PointStamped, "/gripper/state_feedback", 5)
+
         # 数据收集指令发布器
         self.pub_record_cmd = self.create_publisher(Int32, "/recorder/command", 10)
 
@@ -266,6 +269,44 @@ class GripperManager(threading.Thread):
                 # 空闲状态，低频休眠
                 time.sleep(0.01)
 
+class GripperStateFeedback(threading.Thread):
+    """
+    [新增] 独立的夹爪状态反馈线程
+    专门负责定期读取夹爪实际位置并发布
+    """
+    def __init__(self, wrapper, comm):
+        super().__init__(daemon=True)
+        self.wrapper = wrapper
+        self.comm = comm
+        self.running = True
+        self.feedback_rate = 10.0  # Hz - 状态反馈频率
+
+    def run(self):
+        """
+        核心循环：以固定频率读取 Modbus 寄存器 514 (实际位置) 并发布
+        """
+        while self.running:
+            try:
+                # 读取夹爪实际位置 (寄存器 514)
+                real_pos = self.comm.read_reg(514)
+
+                if real_pos is not None:
+                    # 发布状态反馈消息
+                    msg = PointStamped()
+                    msg.header.stamp = self.wrapper.get_clock().now().to_msg()
+                    msg.header.frame_id = "gripper_feedback"
+                    msg.point.x = float(real_pos)
+                    msg.point.y = 0.0
+                    msg.point.z = 0.0
+                    self.wrapper.pub_gripper_state.publish(msg)
+
+            except Exception as e:
+                # 避免异常导致线程崩溃
+                print(f"[ERROR] GripperStateFeedback: {e}")
+
+            # 控制循环频率
+            time.sleep(1.0 / self.feedback_rate)
+
 class SharedMouseState:
     """线程安全的鼠标状态容器"""
     def __init__(self):
@@ -341,6 +382,10 @@ class TeleopController:
         self.gripper_worker = GripperManager(self.robot.node, self.mouse_state)
         self.gripper_worker.start()
 
+        # [新增] 启动独立的夹爪状态反馈线程
+        self.gripper_feedback = GripperStateFeedback(self.robot.node, self.gripper_worker.comm)
+        self.gripper_feedback.start()
+
         # 参数
         self.LOOP_RATE = 100.0 
         self.MOUSE_SENSITIVITY = 0.1
@@ -391,11 +436,12 @@ class TeleopController:
         except: pass
 
         print("=== 系统就绪 ===")
-        print(" [Main Loop]    : 负责机械臂运动 (ServoP)")
-        print(" [Gripper Thread]: 负责夹爪控制与回读")
-        print(" [O/P/L]        : 录制控制")
-        print(" [Z]            : 触发垂直抓取序列")
-        print(" [Tab]          : 暂停/恢复控制（可操作其他窗口）")
+        print(" [Main Loop]       : 负责机械臂运动 (ServoP)")
+        print(" [Gripper Thread]  : 负责夹爪控制与回读")
+        print(" [Feedback Thread] : 定期发布夹爪实际状态 (/gripper/state_feedback @ 10Hz)")
+        print(" [O/P/L]           : 录制控制")
+        print(" [Z]               : 触发垂直抓取序列")
+        print(" [Tab]             : 暂停/恢复控制（可操作其他窗口)")
 
     def _init_pose(self):
         for _ in range(5):
@@ -574,6 +620,8 @@ class TeleopController:
 
         self.gripper_worker.running = False
         self.gripper_worker.join()
+        self.gripper_feedback.running = False
+        self.gripper_feedback.join()
         self.robot.close()
 
 if __name__ == "__main__":
