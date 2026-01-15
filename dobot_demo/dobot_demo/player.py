@@ -145,9 +145,13 @@ class GripperComm:
             # Extract Modbus connection ID from response
             # The response index may be a string like "index: 1" or direct integer
             # Use regex to ensure we get the numeric value
-            match = re.search(r'(\d+)', str(res.index))
-            self.id = int(match.group(1)) if match else int(res.index)
-            self.node.get_logger().info(f"✓ Gripper connected, Modbus ID: {self.id}")
+            try:
+                match = re.search(r'(\d+)', str(res.index))
+                self.id = int(match.group(1)) if match else int(res.index)
+                self.node.get_logger().info(f"✓ Gripper connected, Modbus ID: {self.id}")
+            except (ValueError, TypeError, AttributeError) as e:
+                self.node.get_logger().error(f"✗ Failed to parse Modbus ID from response: {e}")
+                self.id = 0
         else:
             self.node.get_logger().error(f"✗ Gripper connection failed! Response: {res}")
             self.id = 0
@@ -202,10 +206,10 @@ class GripperComm:
         req.count = 1
         res = self.call_service(self.cli_get_hold_regs, req)
         
-        if res and res.res == 0:
+        if res and res.res == 0 and res.value is not None:
             try:
                 return int(res.value)
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError, AttributeError) as e:
                 self.node.get_logger().warn(f"Failed to parse register value: {e}")
         return None
 
@@ -549,7 +553,10 @@ class DataPlayer(Node):
         
         # 处理输入格式（可能是标量或数组）
         if isinstance(gripper_pos, np.ndarray):
-            pos_normalized = float(gripper_pos[0]) if len(gripper_pos) > 0 else 0.0
+            if len(gripper_pos) > 0:
+                pos_normalized = float(gripper_pos[0])
+            else:
+                pos_normalized = 0.0
         else:
             pos_normalized = float(gripper_pos)
         
