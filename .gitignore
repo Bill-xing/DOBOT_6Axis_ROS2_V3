@@ -12,3 +12,4 @@ data/episode_1_rgb.mp4
 .gitignore
 data/*
 
+test_episode/test_episode_0.db3

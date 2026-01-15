@@ -551,6 +551,135 @@ class DatasetPlayer:
         self.gripper_target_pos[0] = float(position)  # 更新引用，供反馈线程读取
         self.gripper_comm.write_reg(259, 1, str(int(position)), wait=False)  # 写入寄存器259
 
+    def get_current_pose(self):
+        """
+        获取机械臂当前位姿
+
+        Returns:
+            numpy array [x, y, z, rx, ry, rz] 或 None（如果失败）
+        """
+        req = GetPose.Request()
+        res = self.node.call_service(self.node.cli_get_pose, req)
+        if res:
+            try:
+                return np.array([res.x, res.y, res.z, res.rx, res.ry, res.rz], dtype=np.float32)
+            except:
+                pass
+        return None
+
+    def check_start_position_safety(self, position_threshold=50.0, rotation_threshold=10.0):
+        """
+        检查当前位置与数据集第一帧的差距，评估安全性
+
+        Args:
+            position_threshold: 位置差距阈值（mm），超过则警告
+            rotation_threshold: 旋转差距阈值（度），超过则警告
+
+        Returns:
+            (is_safe, current_pose, target_pose, pos_diff, rot_diff)
+        """
+        print("\n" + "=" * 70)
+        print("安全检查：当前位置 vs 数据集起始位置")
+        print("=" * 70)
+
+        # 获取当前位姿
+        current_pose = self.get_current_pose()
+        if current_pose is None:
+            print("⚠️  警告：无法获取当前位姿，建议手动确认位置")
+            return False, None, None, None, None
+
+        # 第一帧目标位姿
+        target_pose = self.robot_target[0]
+
+        # 计算位置差距（笛卡尔空间）
+        pos_current = current_pose[:3]
+        pos_target = target_pose[:3]
+        pos_diff = np.linalg.norm(pos_current - pos_target)
+
+        # 计算旋转差距
+        rot_current = current_pose[3:]
+        rot_target = target_pose[3:]
+        rot_diff = np.linalg.norm(rot_current - rot_target)
+
+        # 打印对比信息
+        print(f"\n当前位姿:  X={current_pose[0]:7.1f} Y={current_pose[1]:7.1f} Z={current_pose[2]:7.1f} | "
+              f"RX={current_pose[3]:6.1f} RY={current_pose[4]:6.1f} RZ={current_pose[5]:6.1f}")
+        print(f"起始位姿:  X={target_pose[0]:7.1f} Y={target_pose[1]:7.1f} Z={target_pose[2]:7.1f} | "
+              f"RX={target_pose[3]:6.1f} RY={target_pose[4]:6.1f} RZ={target_pose[5]:6.1f}")
+        print(f"\n位置差距: {pos_diff:.1f} mm")
+        print(f"旋转差距: {rot_diff:.1f} deg")
+
+        # 判断安全性
+        is_safe = pos_diff <= position_threshold and rot_diff <= rotation_threshold
+
+        if is_safe:
+            print(f"\n✓ 安全：差距在阈值内")
+            print(f"  位置阈值: {position_threshold} mm")
+            print(f"  旋转阈值: {rotation_threshold} deg")
+        else:
+            print(f"\n⚠️  警告：差距超过阈值！")
+            print(f"  位置阈值: {position_threshold} mm (当前: {pos_diff:.1f} mm)")
+            print(f"  旋转阈值: {rotation_threshold} deg (当前: {rot_diff:.1f} deg)")
+            print(f"\n直接播放可能导致机械臂突然大幅度移动！")
+
+        print("=" * 70)
+
+        return is_safe, current_pose, target_pose, pos_diff, rot_diff
+
+    def move_to_start_position(self, speed=50, smooth=True):
+        """
+        安全移动到数据集起始位置
+
+        使用MovJ关节运动，平滑移动到第一帧位置
+
+        Args:
+            speed: 移动速度百分比（1-100）
+            smooth: 是否使用平滑运动（关节插补）
+
+        Returns:
+            成功返回True，失败返回False
+        """
+        print("\n正在移动到起始位置...")
+
+        target_pose = self.robot_target[0]
+
+        try:
+            # 方式1：使用MovJ（关节空间运动，避开障碍）
+            from dobot_msgs_v3.srv import MovJ
+            cli_movj = self.node.create_client(MovJ, '/dobot_bringup_v3/srv/MovJ')
+
+            if not cli_movj.wait_for_service(timeout_sec=2.0):
+                print("错误：MovJ服务不可用")
+                return False
+
+            req = MovJ.Request()
+            req.x = float(target_pose[0])
+            req.y = float(target_pose[1])
+            req.z = float(target_pose[2])
+            req.rx = float(target_pose[3])
+            req.ry = float(target_pose[4])
+            req.rz = float(target_pose[5])
+
+            print(f"  目标: X={req.x:.1f} Y={req.y:.1f} Z={req.z:.1f} | "
+                  f"RX={req.rx:.1f} RY={req.ry:.1f} RZ={req.rz:.1f}")
+            print(f"  速度: {speed}%")
+            print("  移动中...")
+
+            future = cli_movj.call_async(req)
+            rclpy.spin_until_future_complete(self.node, future, timeout_sec=30.0)
+
+            if future.result():
+                print("✓ 成功移动到起始位置")
+                time.sleep(0.5)  # 等待稳定
+                return True
+            else:
+                print("✗ 移动失败")
+                return False
+
+        except Exception as e:
+            print(f"错误：移动失败 - {e}")
+            return False
+
     def publish_robot_target(self, pose):
         """
         发布机械臂目标姿态
@@ -572,11 +701,12 @@ class DatasetPlayer:
         msg.rz = float(pose[5])
         self.node.pub_robot_target.publish(msg)
 
-    def play(self):
+    def play(self, auto_move_to_start=True, safety_check=True):
         """
         播放数据集主循环
 
         按时间序列重放轨迹数据：
+        0. [新增] 安全检查：比较当前位置与起始位置
         1. 计算平均时间间隔（从timestamps）
         2. 遍历所有帧：
            - 发送机械臂ServoP指令
@@ -585,11 +715,63 @@ class DatasetPlayer:
            - 按实际时间间隔sleep，保持播放速率
         3. 监控延迟，如果单帧延迟超过10ms则警告
 
+        Args:
+            auto_move_to_start: 如果位置差距过大，是否自动移动到起始位置
+            safety_check: 是否进行安全检查
+
         时间控制：
         - 使用录制时的实际时间间隔（从timestamps计算）
         - 根据playback_rate调整播放速度
         - 实时监控执行时间，动态调整sleep时间
         """
+        # ========== 安全检查 ==========
+        if safety_check:
+            is_safe, current_pose, target_pose, pos_diff, rot_diff = self.check_start_position_safety(
+                position_threshold=50.0,  # 位置阈值：50mm
+                rotation_threshold=10.0   # 旋转阈值：10度
+            )
+
+            if not is_safe and current_pose is not None:
+                print("\n⚠️  检测到位置差距过大！")
+
+                if auto_move_to_start:
+                    print("\n选项1: 自动移动到起始位置（使用MovJ平滑运动）")
+                    print("选项2: 取消播放，手动调整位置")
+                    print("选项3: 忽略警告，强制播放（危险！）")
+
+                    choice = input("\n请选择 [1/2/3]: ").strip()
+
+                    if choice == '1':
+                        # 自动移动到起始位置
+                        success = self.move_to_start_position(speed=50)
+                        if not success:
+                            print("\n✗ 移动失败，取消播放")
+                            return
+                        print("\n✓ 已移动到起始位置，准备播放")
+
+                    elif choice == '2':
+                        print("\n已取消播放，请手动调整机械臂位置")
+                        return
+
+                    elif choice == '3':
+                        confirm = input("\n⚠️  确认强制播放？这可能很危险！[yes/no]: ").strip().lower()
+                        if confirm != 'yes':
+                            print("已取消播放")
+                            return
+                        print("\n⚠️  强制播放模式，请注意安全！")
+
+                    else:
+                        print("无效选择，取消播放")
+                        return
+                else:
+                    print("\n建议：")
+                    print("  1. 手动将机械臂移动到起始位置")
+                    print("  2. 或使用 play(auto_move_to_start=True) 自动移动")
+                    confirm = input("\n是否继续播放？[yes/no]: ").strip().lower()
+                    if confirm != 'yes':
+                        print("已取消播放")
+                        return
+
         print("\n=== 开始播放 ===")
         print("按 Ctrl+C 停止\n")
 
@@ -677,25 +859,64 @@ def main():
     命令行参数：
     - dataset: HDF5数据集文件路径（必需）
     - --rate: 播放速率倍数（可选，默认1.0）
+    - --no-safety-check: 禁用播放前安全检查（不推荐）
+    - --no-auto-move: 禁用自动移动到起始位置
 
     使用示例：
     python3 dataset_player.py ./data/episode_0.hdf5
     python3 dataset_player.py ./data/episode_0.hdf5 --rate 0.5  # 0.5倍速
-    python3 dataset_player.py ./data/episode_0.hdf5 --rate 2.0  # 2倍速
+    python3 dataset_player.py ./data/episode_0.hdf5 --no-safety-check  # 跳过安全检查（危险）
     """
     import argparse
 
-    parser = argparse.ArgumentParser(description='播放HDF5数据集控制机械臂')
-    parser.add_argument('dataset', type=str, help='HDF5数据集路径 (例如: ./data/episode_0.hdf5)')
-    parser.add_argument('--rate', type=float, default=1.0, help='播放速率 (默认: 1.0x)')
+    parser = argparse.ArgumentParser(
+        description='播放HDF5数据集控制机械臂（带安全检查）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例：
+  # 正常播放（带安全检查）
+  python3 dataset_player.py ./data/episode_0.hdf5
+
+  # 0.5倍速慢放
+  python3 dataset_player.py ./data/episode_0.hdf5 --rate 0.5
+
+  # 跳过安全检查（不推荐）
+  python3 dataset_player.py ./data/episode_0.hdf5 --no-safety-check
+
+安全特性：
+  1. 播放前自动检查当前位置与数据集起始位置的差距
+  2. 如果差距过大（>50mm位置或>10度旋转），会提供选项：
+     - 自动移动到起始位置（MovJ平滑运动）
+     - 手动调整后再播放
+     - 强制播放（危险）
+  3. 使用 --no-safety-check 可以完全跳过检查（仅用于调试）
+        """
+    )
+
+    parser.add_argument('dataset', type=str,
+                       help='HDF5数据集路径 (例如: ./data/episode_0.hdf5)')
+    parser.add_argument('--rate', type=float, default=1.0,
+                       help='播放速率 (默认: 1.0x)')
+    parser.add_argument('--no-safety-check', action='store_true',
+                       help='禁用播放前的安全位置检查（不推荐）')
+    parser.add_argument('--no-auto-move', action='store_true',
+                       help='禁用自动移动到起始位置功能')
 
     args = parser.parse_args()
 
     # 创建播放器
     player = DatasetPlayer(args.dataset, playback_rate=args.rate)
 
+    # 安全提示
+    if args.no_safety_check:
+        print("\n⚠️  警告：已禁用安全检查！")
+        print("如果当前位置与起始位置差距过大，机械臂可能突然移动！\n")
+
     # 开始播放
-    player.play()
+    player.play(
+        auto_move_to_start=not args.no_auto_move,
+        safety_check=not args.no_safety_check
+    )
 
     # 关闭
     player.close()
