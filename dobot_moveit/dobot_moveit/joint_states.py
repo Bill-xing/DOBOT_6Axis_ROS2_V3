@@ -176,11 +176,10 @@ class JointStateRelay(Node):
         except Exception: pass
 
     def tool_vector_callback(self, msg):
-        current_time = self.get_clock().now().to_msg()
+        # 保留原始时间戳
         self.pub_tool_vector_relay.publish(msg)
         pose_msg = PoseStamped()
-        pose_msg.header.stamp = current_time
-        pose_msg.header.frame_id = "base_link"
+        pose_msg.header = msg.header  # 直接使用原始header（包含时间戳）
         pose_msg.pose.position.x = msg.x / 1000.0
         pose_msg.pose.position.y = msg.y / 1000.0
         pose_msg.pose.position.z = msg.z / 1000.0

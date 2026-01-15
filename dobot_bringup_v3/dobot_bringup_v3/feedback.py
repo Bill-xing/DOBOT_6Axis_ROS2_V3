@@ -125,22 +125,27 @@ class PublisherNode(Node):
            self.get_logger().info("connection succeeded:30004")
         except:
             self.get_logger().info("Connection failed!!!")
-    def timer_callback(self):                                     
-        msg = ToolVectorActual()                                           
+    def timer_callback(self):
+        msg = ToolVectorActual()
         actual = self.feed_v.feed()
         msg2 = JointState()
         #self.get_logger().info(str(actual))
-        if len(actual)!= 1 :                                     
+        if len(actual)!= 1:
+           # 添加时间戳
+           current_time = self.get_clock().now().to_msg()
+           msg.header.stamp = current_time
+           msg.header.frame_id = 'base_link'
+
            msg2.name = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
-           msg2.header.stamp = self.get_clock().now().to_msg()
+           msg2.header.stamp = current_time
            msg2.header.frame_id = 'joint_states'
            q_target = actual[1]
            joint_a = []
            for ii in q_target:
                joint_a.append(float(ii*3.14159/180))
            print(joint_a)
-           msg2.position = joint_a     
-           msg.x = actual[0][0]                             
+           msg2.position = joint_a
+           msg.x = actual[0][0]
            msg.y = actual[0][1]
            msg.z = actual[0][2]
            msg.rx = actual[0][3]
