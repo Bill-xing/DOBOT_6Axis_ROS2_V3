@@ -223,11 +223,11 @@ class GripperComm:
         if res and res.res == 0 and res.value is not None:
             try:
                 return int(res.value)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
                 # Silent failure consistent with data_collector4.py
                 # Parsing errors are expected in some edge cases (e.g., hardware not responding)
-                # Debug: uncomment to troubleshoot - self.node.get_logger().debug(f"Failed to parse register value: {res.value}")
-                pass
+                # Enable debug logging to troubleshoot: --ros-args --log-level debug
+                self.node.get_logger().debug(f"Failed to parse register value: {res.value}, error: {e}")
         return None
 
 class DataPlayer(Node):
