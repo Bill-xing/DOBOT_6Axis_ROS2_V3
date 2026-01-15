@@ -111,9 +111,14 @@ class GripperComm:
         if not client.service_is_ready():
             return None
         future = client.call_async(request)
-        while not future.done():
-            time.sleep(0.001)
-        return future.result()
+        # Use rclpy.spin_until_future_complete with timeout to avoid busy-wait
+        timeout_sec = 5.0
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=timeout_sec)
+        if future.done():
+            return future.result()
+        else:
+            self.node.get_logger().warn(f"Service call timed out after {timeout_sec}s")
+            return None
     
     def call_service_async_no_wait(self, client, request):
         """异步调用服务（非阻塞，不等待结果）"""
@@ -137,6 +142,9 @@ class GripperComm:
         res = self.call_service(self.cli_modbus_create, req)
         
         if res and res.res == 0:
+            # Extract Modbus connection ID from response
+            # The response index may be a string like "index: 1" or direct integer
+            # Use regex to ensure we get the numeric value
             match = re.search(r'(\d+)', str(res.index))
             self.id = int(match.group(1)) if match else int(res.index)
             self.node.get_logger().info(f"✓ Gripper connected, Modbus ID: {self.id}")
@@ -197,8 +205,8 @@ class GripperComm:
         if res and res.res == 0:
             try:
                 return int(res.value)
-            except:
-                pass
+            except (ValueError, TypeError) as e:
+                self.node.get_logger().warn(f"Failed to parse register value: {e}")
         return None
 
 class DataPlayer(Node):
