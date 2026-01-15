@@ -319,7 +319,7 @@ class GripperComm:
         在节点关闭或对象销毁时调用，确保释放 Modbus 资源。
         """
         # 如果没有有效的连接 ID，则无需关闭
-        if getattr(self, "id", 0) <= 0:
+        if self.id <= 0:
             return
 
         try:
@@ -330,14 +330,13 @@ class GripperComm:
                 self.call_service(self.cli_modbus_close, req)
         except Exception as e:
             # 避免在清理过程中抛出致命异常，仅做调试日志记录
-            node = getattr(self, "node", None)
-            if node is not None:
-                node.get_logger().debug(
+            if hasattr(self, "node") and self.node is not None:
+                self.node.get_logger().debug(
                     f"Failed to close Modbus connection for id {self.id}: {e}"
                 )
         finally:
-            # 标记为无效，防止重复关闭
-            self.id = -1
+            # 标记为无效，防止重复关闭（使用0保持一致性）
+            self.id = 0
 
     def __del__(self):
         """
@@ -684,7 +683,7 @@ class DataPlayer(Node):
             - 如果夹爪未初始化，记录一次警告并跳过（不影响机械臂运动）
         """
         # 检查夹爪是否可用
-        if self.gripper_comm is None or getattr(self.gripper_comm, "id", 0) <= 0:
+        if self.gripper_comm is None or self.gripper_comm.id <= 0:
             # 仅在第一次检测到夹爪不可用时给出警告，避免日志刷屏
             if not hasattr(self, "_gripper_unavailable_warned"):
                 self._gripper_unavailable_warned = True
@@ -885,6 +884,9 @@ def main(args=None):
         print(f"Error: {e}")
     finally:
         if 'player' in locals():
+            # 清理夹爪连接
+            if hasattr(player, 'gripper_comm') and player.gripper_comm is not None:
+                player.gripper_comm.close()
             player.destroy_node()
         rclpy.shutdown()
 
