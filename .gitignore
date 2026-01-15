@@ -13,3 +13,4 @@ data/episode_1_rgb.mp4
 data/*
 
 test_episode/test_episode_0.db3
+playback_eval/evaluation_1.hdf5
