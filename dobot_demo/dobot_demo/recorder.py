@@ -1,5 +1,4 @@
 
-
 import rclpy
 from rclpy.node import Node
 import h5py
@@ -7,169 +6,206 @@ import numpy as np
 import os
 import cv2
 from cv_bridge import CvBridge
-from collections import deque
 import threading
-import time
 
 # ROS Messages
-from sensor_msgs.msg import Image, JointState, CameraInfo
-from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Int32
+from dobot_msgs_v3.msg import ToolVectorActual
+
+# Message Filters for time synchronization
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 
 class DataRecorder(Node):
     def __init__(self):
         super().__init__('data_recorder_node')
-        
+
         # 参数配置
         self.data_dir = "./data"
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
-            
+
         self.bridge = CvBridge()
-        
+
         # 状态控制
         # 0: Idle/Discard, 1: Recording, 2: Save
         self.recording_state = 0
         self.episode_buffer = [] # 暂存当前episode数据
         self.mutex = threading.Lock()
-        
-        # === 缓存最新的传感器数据 ===
-        self.last_color = None
-        self.last_depth = None
         self.last_camera_info = None
-        self.last_joint_state = None
-        self.last_gripper_state = None
-        self.last_ee_pose = None
-        
-        # === 订阅器 ===
-        # 1. 指令 (来自控制脚本)
-        self.sub_cmd = self.create_subscription(Int32, "/recorder/command", self.cmd_callback, 10)
-        
-        # 2. 相机 (假设Orbbec发布到以下Topic，根据Launch文件调整)
-        self.sub_color = self.create_subscription(Image, "/camera/color/image_raw", self.color_callback, 10)
-        self.sub_depth = self.create_subscription(Image, "/camera/depth/image_raw", self.depth_callback, 10)
-        self.sub_info = self.create_subscription(CameraInfo, "/camera/color/camera_info", self.info_callback, 10)
-        
-        # 3. 机器人状态
-        self.sub_joints = self.create_subscription(JointState, "/joint_states", self.joint_callback, 10)
-        self.sub_gripper = self.create_subscription(JointState, "/gripper/state", self.gripper_callback, 10)
-        self.sub_pose = self.create_subscription(PoseStamped, "/end_effector_pose", self.pose_callback, 10)
-        
-        self.get_logger().info("Data Recorder Initialized. Press 'O' in controller to start.")
 
-    # === 回调函数：只负责更新最新数据 ===
-    
+        # === 订阅器 ===
+        # 1. 指令订阅器 (独立订阅,不参与时间同步)
+        self.sub_cmd = self.create_subscription(Int32, "/recorder/command", self.cmd_callback, 10)
+
+        # 2. 相机内参订阅器 (独立订阅,不参与时间同步)
+        self.sub_info = self.create_subscription(CameraInfo, "/camera/color/camera_info", self.info_callback, 10)
+
+        # 3. 使用 message_filters 进行时间同步的订阅器
+        # 创建 message_filters Subscriber (而不是普通的 create_subscription)
+        self.sub_color = Subscriber(self, Image, "/camera/color/image_raw")
+        self.sub_depth = Subscriber(self, Image, "/camera/depth/image_raw")
+        self.sub_robot_current = Subscriber(self, ToolVectorActual, "/dobot_msgs_v3/msg/ToolVectorActual")
+        self.sub_robot_target = Subscriber(self, ToolVectorActual, "/robot/target_pose")
+        self.sub_gripper_current = Subscriber(self, PointStamped, "/gripper/state_feedback")
+        self.sub_gripper_target = Subscriber(self, PointStamped, "/gripper/command_update")
+
+        # 4. 创建 ApproximateTimeSynchronizer
+        # slop: 允许的最大时间差 (秒)
+        # 相机是30Hz (33.3ms间隔), 机械臂/夹爪是100Hz (10ms间隔)
+        # 设置slop为50ms (0.05秒) 来容忍网络延迟和不同频率
+        self.sync = ApproximateTimeSynchronizer(
+            [self.sub_color, self.sub_depth, self.sub_robot_current, self.sub_robot_target,
+             self.sub_gripper_current, self.sub_gripper_target],
+            queue_size=10,
+            slop=0.05  # 50ms tolerance
+        )
+        self.sync.registerCallback(self.synchronized_callback)
+
+        self.get_logger().info("=== VLA Data Recorder Initialized (ApproximateTimeSynchronizer) ===")
+        self.get_logger().info("Time synchronization: ApproximateTimeSynchronizer with 50ms tolerance")
+        self.get_logger().info("Subscribed topics (time-synchronized):")
+        self.get_logger().info("  - Camera (30Hz): /camera/color/image_raw, /camera/depth/image_raw")
+        self.get_logger().info("  - Robot Current (100Hz): /dobot_msgs_v3/msg/ToolVectorActual")
+        self.get_logger().info("  - Robot Target (100Hz): /robot/target_pose")
+        self.get_logger().info("  - Gripper Current (100Hz): /gripper/state_feedback")
+        self.get_logger().info("  - Gripper Target (100Hz): /gripper/command_update")
+        self.get_logger().info("Press 'O' in controller to start recording.")
+
+    # === 回调函数 ===
+
     def cmd_callback(self, msg):
+        """处理录制指令"""
         new_state = msg.data
         with self.mutex:
             if new_state == 1 and self.recording_state != 1:
                 self.get_logger().info(">>> START RECORDING")
                 self.episode_buffer = [] # 清空缓存
                 self.recording_state = 1
-                
+
             elif new_state == 2 and self.recording_state == 1:
                 self.get_logger().info(">>> STOP & SAVING...")
                 self.recording_state = 2 # 标记为保存中
                 self.save_dataset()
                 self.recording_state = 0 # 回到空闲
-                
+
             elif new_state == 0:
                 if self.recording_state == 1:
                     self.get_logger().info(">>> STOP & DISCARD")
                 self.recording_state = 0
                 self.episode_buffer = []
 
-    def color_callback(self, msg):
-        self.last_color = msg
-        # 以RGB图像的到达作为触发信号，执行一次对齐和记录
-        self.try_record_frame()
-
-    def depth_callback(self, msg):
-        self.last_depth = msg
-    
     def info_callback(self, msg):
-        # CameraInfo 通常不变，只需要存一次或最新的即可
+        """缓存相机内参"""
         self.last_camera_info = msg
 
-    def joint_callback(self, msg):
-        self.last_joint_state = msg
-
-    def gripper_callback(self, msg):
-        self.last_gripper_state = msg
-
-    def pose_callback(self, msg):
-        self.last_ee_pose = msg
-
-    # === 核心逻辑：数据对齐与记录 ===
-    
-    def try_record_frame(self):
+    def synchronized_callback(self, color_msg, depth_msg, robot_current_msg, robot_target_msg,
+                            gripper_current_msg, gripper_target_msg):
         """
-        当收到一张新图像时，尝试打包当前所有传感器数据。
-        这是一种"以图像为基准"的软同步策略。
+        时间同步回调函数
+        当所有传感器数据的时间戳在50ms容差内对齐时调用此函数
+
+        参数说明：
+        - color_msg: Image - RGB图像
+        - depth_msg: Image - 深度图像
+        - robot_current_msg: ToolVectorActual - 机械臂当前位姿
+        - robot_target_msg: ToolVectorActual - 机械臂目标位姿
+        - gripper_current_msg: PointStamped - 夹爪当前状态
+        - gripper_target_msg: PointStamped - 夹爪目标状态
+
+        时间对齐方案：
+        - 使用 ApproximateTimeSynchronizer 进行基于时间戳的软同步
+        - slop=50ms: 允许50ms的时间戳差异
+        - 算法会选择时间戳最接近的消息组合进行打包
         """
         if self.recording_state != 1:
             return
 
         with self.mutex:
-            # 检查必要数据是否存在
-            if self.last_color is None or self.last_joint_state is None or \
-               self.last_gripper_state is None or self.last_ee_pose is None:
-                # self.get_logger().warn("Waiting for all sensors...", throttle_duration_sec=1.0)
-                return
-
-            # 数据打包
             try:
                 # 转换图像
-                cv_image = self.bridge.imgmsg_to_cv2(self.last_color, desired_encoding='bgr8')
+                cv_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
                 cv_depth = None
-                if self.last_depth:
-                    cv_depth = self.bridge.imgmsg_to_cv2(self.last_depth, desired_encoding='passthrough')
+                if depth_msg:
+                    cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
+                # 提取时间戳 (使用color图像的时间戳作为参考)
+                timestamp = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
+
+                # 打包数据
                 frame_data = {
-                    'timestamp': self.last_color.header.stamp.sec + self.last_color.header.stamp.nanosec * 1e-9,
+                    'timestamp': timestamp,
                     'image': cv_image,
                     'depth': cv_depth,
-                    'qpos': np.array(self.last_joint_state.position, dtype=np.float32),
-                    'gripper_pos': np.array(self.last_gripper_state.position, dtype=np.float32),
-                    'ee_pose': np.array([
-                        self.last_ee_pose.pose.position.x,
-                        self.last_ee_pose.pose.position.y,
-                        self.last_ee_pose.pose.position.z,
-                        self.last_ee_pose.pose.orientation.x, # 注意: Dobot通常只给Position，Orientation可能需要自己算或为空
-                        self.last_ee_pose.pose.orientation.y,
-                        self.last_ee_pose.pose.orientation.z,
-                        self.last_ee_pose.pose.orientation.w
-                    ], dtype=np.float32)
+
+                    # 机械臂当前状态 (x, y, z, rx, ry, rz)
+                    'robot_current': np.array([
+                        robot_current_msg.x,
+                        robot_current_msg.y,
+                        robot_current_msg.z,
+                        robot_current_msg.rx,
+                        robot_current_msg.ry,
+                        robot_current_msg.rz
+                    ], dtype=np.float32),
+
+                    # 机械臂目标状态 (x, y, z, rx, ry, rz)
+                    'robot_target': np.array([
+                        robot_target_msg.x,
+                        robot_target_msg.y,
+                        robot_target_msg.z,
+                        robot_target_msg.rx,
+                        robot_target_msg.ry,
+                        robot_target_msg.rz
+                    ], dtype=np.float32),
+
+                    # 夹爪当前状态 (position: 0-1000)
+                    'gripper_current': np.array([gripper_current_msg.point.x], dtype=np.float32),
+
+                    # 夹爪目标状态 (position: 0-1000)
+                    'gripper_target': np.array([gripper_target_msg.point.x], dtype=np.float32),
+
+                    # [调试信息] 记录各传感器的时间戳，便于验证时间对齐
+                    'timestamps_debug': {
+                        'color': timestamp,
+                        'depth': depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec * 1e-9,
+                        'robot_current': robot_current_msg.header.stamp.sec + robot_current_msg.header.stamp.nanosec * 1e-9,
+                        'robot_target': robot_target_msg.header.stamp.sec + robot_target_msg.header.stamp.nanosec * 1e-9,
+                        'gripper_current': gripper_current_msg.header.stamp.sec + gripper_current_msg.header.stamp.nanosec * 1e-9,
+                        'gripper_target': gripper_target_msg.header.stamp.sec + gripper_target_msg.header.stamp.nanosec * 1e-9,
+                    }
                 }
-                
-                # 如果有相机内参，也记录（通常只需要第一帧，但为了方便全存）
+
+                # 如果有相机内参，也记录
                 if self.last_camera_info:
                     frame_data['camera_intrinsics'] = np.array(self.last_camera_info.k, dtype=np.float32).reshape(3, 3)
 
                 self.episode_buffer.append(frame_data)
-                
-                # 打印进度
+
+                # 打印进度和时间戳差异 (用于验证同步质量)
                 if len(self.episode_buffer) % 30 == 0:
-                    print(f"Recording... {len(self.episode_buffer)} frames")
-                    
+                    ts_debug = frame_data['timestamps_debug']
+                    max_diff = max(ts_debug.values()) - min(ts_debug.values())
+                    print(f"Recording... {len(self.episode_buffer)} frames, max timestamp diff: {max_diff*1000:.2f}ms")
+
             except Exception as e:
-                self.get_logger().error(f"Error packing frame: {e}")
+                self.get_logger().error(f"Error in synchronized_callback: {e}")
 
     # === 保存逻辑 ===
-    
+
     def get_next_episode_index(self):
         """遍历data目录，找到下一个可用的编号"""
         existing_files = [f for f in os.listdir(self.data_dir) if f.startswith('episode_') and f.endswith('.hdf5')]
         if not existing_files:
             return 0
-        
+
         indices = []
         for f in existing_files:
             try:
                 idx = int(f.split('_')[1].split('.')[0])
                 indices.append(idx)
             except: pass
-        
+
         return max(indices) + 1 if indices else 0
 
     def save_dataset(self):
@@ -179,30 +215,36 @@ class DataRecorder(Node):
 
         idx = self.get_next_episode_index()
         file_path = os.path.join(self.data_dir, f"episode_{idx}.hdf5")
-        
+
         self.get_logger().info(f"Saving {len(self.episode_buffer)} frames to {file_path}...")
-        
+
         try:
             with h5py.File(file_path, 'w') as f:
                 # 1. 提取各个数据流
                 data_len = len(self.episode_buffer)
-                
+
                 # 预分配数据集 (Chunked storage for images)
                 # 图像：(N, H, W, 3)
                 img_sample = self.episode_buffer[0]['image']
-                dset_img = f.create_dataset('observations/images/color', 
-                                          (data_len, img_sample.shape[0], img_sample.shape[1], 3), 
+                dset_img = f.create_dataset('observations/images/color',
+                                          (data_len, img_sample.shape[0], img_sample.shape[1], 3),
                                           dtype='uint8', chunks=(1, img_sample.shape[0], img_sample.shape[1], 3))
-                
+
                 if self.episode_buffer[0]['depth'] is not None:
                     depth_sample = self.episode_buffer[0]['depth']
-                    dset_depth = f.create_dataset('observations/images/depth', 
-                                                (data_len, depth_sample.shape[0], depth_sample.shape[1]), 
+                    dset_depth = f.create_dataset('observations/images/depth',
+                                                (data_len, depth_sample.shape[0], depth_sample.shape[1]),
                                                 dtype='uint16', chunks=(1, depth_sample.shape[0], depth_sample.shape[1]))
 
-                dset_qpos = f.create_dataset('observations/qpos', (data_len, 6), dtype='float32') # Dobot 6 axis
-                dset_gpos = f.create_dataset('observations/gripper_pos', (data_len, 1), dtype='float32')
-                dset_pose = f.create_dataset('observations/ee_pose', (data_len, 7), dtype='float32')
+                # 机械臂状态：当前 + 目标 (x, y, z, rx, ry, rz)
+                dset_robot_current = f.create_dataset('observations/robot_current', (data_len, 6), dtype='float32')
+                dset_robot_target = f.create_dataset('actions/robot_target', (data_len, 6), dtype='float32')
+
+                # 夹爪状态：当前 + 目标 (position: 0-1000)
+                dset_gripper_current = f.create_dataset('observations/gripper_current', (data_len, 1), dtype='float32')
+                dset_gripper_target = f.create_dataset('actions/gripper_target', (data_len, 1), dtype='float32')
+
+                # 时间戳
                 dset_time = f.create_dataset('timestamp', (data_len,), dtype='float64')
 
                 # 2. 写入数据
@@ -210,22 +252,27 @@ class DataRecorder(Node):
                     dset_img[i] = frame['image']
                     if frame['depth'] is not None:
                         dset_depth[i] = frame['depth']
-                    
-                    # 确保维度匹配
-                    if len(frame['qpos']) >= 6: dset_qpos[i] = frame['qpos'][:6]
-                    dset_gpos[i] = frame['gripper_pos']
-                    dset_pose[i] = frame['ee_pose']
+
+                    dset_robot_current[i] = frame['robot_current']
+                    dset_robot_target[i] = frame['robot_target']
+                    dset_gripper_current[i] = frame['gripper_current']
+                    dset_gripper_target[i] = frame['gripper_target']
                     dset_time[i] = frame['timestamp']
-                
+
                 # 保存相机内参 (取第一帧即可)
                 if 'camera_intrinsics' in self.episode_buffer[0]:
                     f.create_dataset('camera/intrinsics', data=self.episode_buffer[0]['camera_intrinsics'])
-                
+
+                # 保存元数据
                 f.attrs['sim'] = False
                 f.attrs['total_frames'] = data_len
-                
+                f.attrs['sync_method'] = 'ApproximateTimeSynchronizer'
+                f.attrs['sync_tolerance_ms'] = 50.0
+                f.attrs['camera_frequency_hz'] = 30
+                f.attrs['robot_frequency_hz'] = 100
+
             self.get_logger().info(f"Save successfully! Saved to {file_path}")
-            
+
         except Exception as e:
             self.get_logger().error(f"Failed to save dataset: {e}")
 
