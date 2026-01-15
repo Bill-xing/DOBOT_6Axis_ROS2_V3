@@ -26,7 +26,11 @@
 调用服务:
     - /dobot_bringup_v3/srv/EnableRobot: 使能机械臂
     - /dobot_bringup_v3/srv/ServoJ: 伺服关节控制（主要方式）
-    - /gripper/control: 夹爪控制（需根据实际接口调整）
+    - /dobot_bringup_v3/srv/ServoP: 笛卡尔空间伺服控制
+    - /dobot_bringup_v3/srv/ModbusCreate: 创建夹爪Modbus连接
+    - /dobot_bringup_v3/srv/ModbusClose: 关闭夹爪Modbus连接
+    - /dobot_bringup_v3/srv/SetHoldRegs: 夹爪位置控制
+    - /dobot_bringup_v3/srv/GetHoldRegs: 夹爪状态读取
 
 参数:
     - file_path: HDF5文件路径（必需）
@@ -98,13 +102,56 @@ class GripperComm:
         self.cli_set_hold_regs = node.create_client(SetHoldRegs, '/dobot_bringup_v3/srv/SetHoldRegs')
         self.cli_get_hold_regs = node.create_client(GetHoldRegs, '/dobot_bringup_v3/srv/GetHoldRegs')
         
-        # 等待服务可用
+        # 等待服务可用（带重试机制）
         node.get_logger().info("Waiting for Modbus services...")
-        if not self.cli_modbus_create.wait_for_service(timeout_sec=2.0):
-            node.get_logger().warn("Modbus services not available, gripper control disabled")
+        if not self._wait_for_service_with_retries(
+                self.cli_modbus_create,
+                '/dobot_bringup_v3/srv/ModbusCreate'):
+            # 在多次重试后仍不可用，则禁用夹爪控制
             return
-            
+
+        # 初始化 Modbus 连接
         self.init_connection()
+        if self.id == 0:
+            # init_connection 失败时显式报错，区分临时不可用和永久失败
+            self.node.get_logger().error(
+                "Failed to initialize Modbus connection for gripper; gripper control disabled"
+            )
+    
+    def _wait_for_service_with_retries(
+            self,
+            client,
+            service_name: str,
+            retries: int = 3,
+            timeout_sec: float = 2.0,
+            delay_between_retries: float = 2.0) -> bool:
+        """
+        等待服务可用（带重试），用于区分临时不可用和持久故障。
+
+        参数:
+            client:   要等待的服务客户端
+            service_name: 服务名称（仅用于日志）
+            retries:  重试次数（总尝试次数 = retries）
+            timeout_sec: 每次 wait_for_service 的超时时间
+            delay_between_retries: 两次尝试之间的等待时间（秒）
+        返回:
+            True  - 服务在重试过程中变为可用
+            False - 在所有重试后服务仍不可用
+        """
+        for attempt in range(1, retries + 1):
+            if client.wait_for_service(timeout_sec=timeout_sec):
+                return True
+            self.node.get_logger().warn(
+                f"Modbus service '{service_name}' not available "
+                f"(attempt {attempt}/{retries}, waited {timeout_sec:.1f}s)"
+            )
+            if attempt < retries:
+                time.sleep(delay_between_retries)
+        self.node.get_logger().error(
+            f"Modbus service '{service_name}' not available after "
+            f"{retries} attempts, giving up"
+        )
+        return False
     
     def call_service(self, client, request):
         """
@@ -119,20 +166,44 @@ class GripperComm:
             return None
         future = client.call_async(request)
         # 添加超时保护，避免无限等待
-        timeout_count = 0
         max_timeout_ms = 5000  # 5秒超时
+        timeout_sec = max_timeout_ms / 1000.0
+        poll_interval_sec = 0.005  # 5ms 轮询间隔：仍然足够及时，但更省CPU
+        start_time = time.time()
         while not future.done():
-            time.sleep(0.001)  # 1ms 轮询间隔（保持与data_collector4.py一致）
-            timeout_count += 1
-            if timeout_count >= max_timeout_ms:
+            if (time.time() - start_time) >= timeout_sec:
                 self.node.get_logger().warn(f"Service call timed out after {max_timeout_ms}ms")
+                # 取消未完成的 future，避免潜在资源泄漏
+                future.cancel()
                 return None
+            time.sleep(poll_interval_sec)
         return future.result()
     
     def call_service_async_no_wait(self, client, request):
         """异步调用服务（非阻塞，不等待结果）"""
-        if client.service_is_ready():
-            client.call_async(request)
+        if not client.service_is_ready():
+            self.node.get_logger().warn("Async service client is not ready; skipping request")
+            return
+        try:
+            future = client.call_async(request)
+        except Exception as exc:
+            self.node.get_logger().error(f"Failed to call async service: {exc}")
+            return
+
+        # 为异步调用添加回调，用于记录可能的异常，避免静默失败
+        def _log_future_result(fut):
+            try:
+                exc_inner = fut.exception()
+                if exc_inner is not None:
+                    self.node.get_logger().warn(f"Async service call resulted in exception: {exc_inner}")
+            except Exception as callback_exc:
+                self.node.get_logger().error(f"Error while processing async service future: {callback_exc}")
+
+        try:
+            future.add_done_callback(_log_future_result)
+        except Exception as exc:
+            # 某些实现中 future 可能不支持 add_done_callback
+            self.node.get_logger().debug(f"Could not add done callback to async service future: {exc}")
     
     def init_connection(self):
         """初始化 Modbus 连接"""
@@ -154,14 +225,18 @@ class GripperComm:
         if res and res.res == 0:
             # Extract Modbus connection ID from response
             # The response index format varies (may be "index: 1" string or integer)
-            # Using regex ensures robust parsing across different response formats
-            # This pattern is consistent with data_collector4.py
+            # Check type first before parsing
             try:
-                match = re.search(r'(\d+)', str(res.index))
-                if match:
-                    self.id = int(match.group(1))
+                # If index is already an integer, use it directly
+                if isinstance(res.index, int):
+                    self.id = res.index
                 else:
-                    self.id = int(res.index)
+                    # Fallback to parsing string-like index (e.g., "index: 1")
+                    match = re.search(r'(\d+)', str(res.index))
+                    if match:
+                        self.id = int(match.group(1))
+                    else:
+                        raise ValueError(f"Cannot extract numeric Modbus ID from index: {res.index!r}")
                 self.node.get_logger().info(f"✓ Gripper connected, Modbus ID: {self.id}")
             except (ValueError, TypeError, AttributeError) as e:
                 self.node.get_logger().error(f"✗ Failed to parse Modbus ID from response: {e}")
@@ -169,7 +244,6 @@ class GripperComm:
         else:
             self.node.get_logger().error(f"✗ Gripper connection failed! Response: {res}")
             self.id = 0
-            return
         
         # 初始化夹爪
         if self.id > 0:
@@ -223,12 +297,57 @@ class GripperComm:
         if res and res.res == 0 and res.value is not None:
             try:
                 return int(res.value)
-            except (ValueError, TypeError) as e:
-                # Silent failure consistent with data_collector4.py
+            except ValueError as e:
                 # Parsing errors are expected in some edge cases (e.g., hardware not responding)
-                # Enable debug logging to troubleshoot: --ros-args --log-level debug
-                self.node.get_logger().debug(f"Failed to parse register value: {res.value}, error: {e}")
+                # Log at warning level so issues are visible even without debug logging.
+                self.node.get_logger().warning(
+                    f"Failed to parse register value as int: {res.value!r}, error: {e}"
+                )
+            except TypeError as e:
+                # Type errors indicate an unexpected response type or programming issue
+                # Treat these as errors rather than silently returning None.
+                self.node.get_logger().error(
+                    f"Unexpected type for register value: {type(res.value)!r}, value: {res.value!r}, error: {e}"
+                )
+                raise
         return None
+
+    def close(self):
+        """
+        关闭 Modbus 连接
+        
+        在节点关闭或对象销毁时调用，确保释放 Modbus 资源。
+        """
+        # 如果没有有效的连接 ID，则无需关闭
+        if getattr(self, "id", 0) <= 0:
+            return
+
+        try:
+            # 只有在存在对应客户端时才尝试关闭
+            if hasattr(self, "cli_modbus_close"):
+                req = ModbusClose.Request()
+                req.index = self.id
+                self.call_service(self.cli_modbus_close, req)
+        except Exception as e:
+            # 避免在清理过程中抛出致命异常，仅做调试日志记录
+            node = getattr(self, "node", None)
+            if node is not None:
+                node.get_logger().debug(
+                    f"Failed to close Modbus connection for id {self.id}: {e}"
+                )
+        finally:
+            # 标记为无效，防止重复关闭
+            self.id = -1
+
+    def __del__(self):
+        """
+        析构函数，确保对象被销毁时尝试关闭 Modbus 连接。
+        """
+        try:
+            self.close()
+        except Exception:
+            # 析构阶段不应抛出异常，尤其是在解释器关闭期间
+            pass
 
 class DataPlayer(Node):
     """
@@ -562,29 +681,55 @@ class DataPlayer(Node):
         说明:
             - 将标准化的夹爪位置（0-1）映射到实际硬件范围（0-1000）
             - 使用异步非阻塞调用，确保高频率控制不受影响
-            - 如果夹爪未初始化，静默跳过（不影响机械臂运动）
+            - 如果夹爪未初始化，记录一次警告并跳过（不影响机械臂运动）
         """
         # 检查夹爪是否可用
-        if self.gripper_comm is None or self.gripper_comm.id <= 0:
+        if self.gripper_comm is None or getattr(self.gripper_comm, "id", 0) <= 0:
+            # 仅在第一次检测到夹爪不可用时给出警告，避免日志刷屏
+            if not hasattr(self, "_gripper_unavailable_warned"):
+                self._gripper_unavailable_warned = True
+                self.get_logger().warn(
+                    "Gripper command requested, but gripper communication is not initialized "
+                    "or disabled. Gripper actions during playback will be skipped."
+                )
             return
         
-        # 处理输入格式（可能是标量或数组）
-        if isinstance(gripper_pos, np.ndarray):
-            if len(gripper_pos) > 0:
-                pos_normalized = float(gripper_pos[0])
-            else:
-                # 空数组通常表示数据问题，记录警告
-                self.get_logger().warn("Received empty gripper_pos array, defaulting to 0.0 (closed)")
-                pos_normalized = 0.0
-        else:
-            pos_normalized = float(gripper_pos)
+        # 处理输入格式（可能是标量、数组或其他序列）
+        try:
+            arr = np.asarray(gripper_pos)
+        except Exception as e:
+            # 无法转换为数组，记录警告并跳过本次指令
+            self.get_logger().warn(
+                f"Invalid gripper_pos type {type(gripper_pos)} ({e}), skipping gripper command"
+            )
+            return
+        
+        if arr.size == 0:
+            # 空数组通常表示数据问题，记录警告并跳过本次夹爪指令
+            self.get_logger().warn("Received empty gripper_pos array; skipping gripper command for this frame")
+            return
+        
+        # 取第一个元素并尝试转换为浮点数
+        try:
+            pos_normalized = float(arr.flat[0])
+        except (TypeError, ValueError) as e:
+            self.get_logger().warn(
+                f"Non-numeric gripper_pos value {arr.flat[0]!r} ({e}), skipping gripper command"
+            )
+            return
+        
+        # 检测并警告超出范围的值（数据质量问题）
+        if pos_normalized < 0.0 or pos_normalized > 1.0:
+            self.get_logger().warn(
+                f"Gripper position {pos_normalized:.3f} outside [0, 1], clipping to range."
+            )
         
         # 限制范围到 [0, 1]
         pos_normalized = np.clip(pos_normalized, 0.0, 1.0)
         
-        # 映射到硬件范围 [0, 1000]
+        # 映射到硬件范围 [0, 1000]，使用 round 提供更精确的映射
         # 注意：0=闭合，1000=张开
-        hardware_pos = int(pos_normalized * 1000)
+        hardware_pos = int(round(pos_normalized * 1000))
         
         # 发送非阻塞指令到寄存器 259（位置控制）
         self.gripper_comm.write_reg(259, 1, str(hardware_pos), wait=False)
