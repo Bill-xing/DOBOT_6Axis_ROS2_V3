@@ -1,3 +1,4 @@
+#非常重要的文件，需要修改相机内参信息格式，让其满足手眼标定程序的要求
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo
