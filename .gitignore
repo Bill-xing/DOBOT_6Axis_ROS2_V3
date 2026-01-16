@@ -32,3 +32,6 @@ dobot_demo/dobot_demo/convert/lerobot_dataset/videos/chunk-000/observation.image
 dobot_demo/dobot_demo/convert/data/episode_0.hdf5
 dobot_demo/dobot_demo/convert/data/episode_1.hdf5
 dobot_demo/dobot_demo/convert/data/episode_2.hdf5
+dobot_demo/dobot_demo/convert/dataset_preview/episode_000_frame_000.jpg
+dobot_demo/dobot_demo/convert/dataset_preview/episode_001_frame_000.jpg
+dobot_demo/dobot_demo/convert/dataset_preview/episode_002_frame_000.jpg
