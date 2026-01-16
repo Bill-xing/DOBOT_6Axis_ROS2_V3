@@ -258,8 +258,8 @@ class DobotApiDashboard(DobotApi):
         string = "PositiveSolution({:f},{:f},{:f},{:f},{:d},{:d}".format(offset1,offset2,offset3,offset4,user,tool)+")"
         return self.sendRecvMsg(string)
 
-    def InverseSolution(self,offset1,offset2,offset3,offset4,user,tool,*dynParams):       
-        string = "InverseSolution({:f},{:f},{:f},{:f},{:d},{:d}".format(offset1,offset2,offset3,offset4,user,tool)
+    def InverseSolution(self,offset1,offset2,offset3,offset4,offset5,offset6,user,tool,*dynParams):       
+        string = "InverseSolution({:f},{:f},{:f},{:f},{:f},{:f},{:d},{:d}".format(offset1,offset2,offset3,offset4,offset5,offset6,user,tool)
         for params in dynParams:
             print(type(params), params)
             string = string + repr(params)
