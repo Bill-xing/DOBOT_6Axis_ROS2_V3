@@ -1,0 +1,35 @@
+name: lerobot_convert
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip=23.3
+
+  # 核心依赖（通过 conda 安装更稳定）
+  - numpy=1.24.3
+  - h5py=3.9.0
+  - pillow=10.0.0
+
+  # Pip 依赖
+  - pip:
+      # OpenCV (使用 pip 版本避免库冲突)
+      - opencv-python-headless==4.8.0.76
+
+      # Parquet 文件处理
+      - pyarrow==14.0.1
+
+      # 进度条和工具
+      - tqdm==4.66.1
+
+      # 可选：用于验证和可视化
+      - matplotlib==3.8.0
+      - pandas==2.1.1
+
+      # 可选：用于 LeRobot 框架集成（如需训练模型）
+      # 取消注释以下行来安装 LeRobot 依赖
+      # - torch==2.1.0
+      # - torchvision==0.16.0
+      # - lerobot>=2.0.0
+      # - huggingface-hub==0.19.4
+      # - datasets==2.14.6

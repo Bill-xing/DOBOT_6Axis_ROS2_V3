@@ -19,3 +19,16 @@ playback_eval/evaluation_2.hdf5
 playback_eval/evaluation_3.hdf5
 .gitignore
 playback_eval/evaluation_4.hdf5
+dobot_demo/dobot_demo/convert/lerobot_dataset/README.md
+dobot_demo/dobot_demo/convert/lerobot_dataset/data/chunk-000/episode_000000.parquet
+dobot_demo/dobot_demo/convert/lerobot_dataset/data/chunk-000/episode_000001.parquet
+dobot_demo/dobot_demo/convert/lerobot_dataset/data/chunk-000/episode_000002.parquet
+dobot_demo/dobot_demo/convert/lerobot_dataset/meta/episodes.jsonl
+dobot_demo/dobot_demo/convert/lerobot_dataset/meta/info.json
+dobot_demo/dobot_demo/convert/lerobot_dataset/meta/tasks.jsonl
+dobot_demo/dobot_demo/convert/lerobot_dataset/videos/chunk-000/observation.images.top/episode_000000.mp4
+dobot_demo/dobot_demo/convert/lerobot_dataset/videos/chunk-000/observation.images.top/episode_000001.mp4
+dobot_demo/dobot_demo/convert/lerobot_dataset/videos/chunk-000/observation.images.top/episode_000002.mp4
+dobot_demo/dobot_demo/convert/data/episode_0.hdf5
+dobot_demo/dobot_demo/convert/data/episode_1.hdf5
+dobot_demo/dobot_demo/convert/data/episode_2.hdf5
