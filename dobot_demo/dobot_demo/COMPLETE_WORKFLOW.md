@@ -279,7 +279,7 @@ EOF
 cd /home/hit/dobot_ws_xing/src/DOBOT_6Axis_ROS2_V3
 
 # 原速播放（带安全检查）
-python3 dobot_demo/dobot_demo/dataset_player.py data/episode_0.hdf5
+python3 dobot_demo/dobot_demo/dataset_player.py /home/hit/dobot_ws_xing/data/episode_0.hdf5
 
 # 播放清洗后的数据
 python3 dobot_demo/dobot_demo/dataset_player.py cleaned/episode_0_cleaned_merged.hdf5

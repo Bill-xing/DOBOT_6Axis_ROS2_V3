@@ -14,3 +14,8 @@ data/*
 
 test_episode/test_episode_0.db3
 playback_eval/evaluation_1.hdf5
+playback_eval/evaluation_2.hdf5
+.gitignore
+playback_eval/evaluation_3.hdf5
+.gitignore
+playback_eval/evaluation_4.hdf5
