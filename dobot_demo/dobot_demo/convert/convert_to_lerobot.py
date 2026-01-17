@@ -20,9 +20,10 @@ LeRobot v2.0 标准目录结构:
     │       │   └── ...
     │       └── ...
     └── meta/
-        ├── info.json
-        ├── episodes.jsonl
-        └── tasks.jsonl
+        ├── info.json          # 数据集schema和配置
+        ├── stats.json         # 统计信息（min/max/mean/std）
+        ├── episodes.jsonl     # 每个episode的元数据
+        └── tasks.jsonl        # 任务描述
 
 使用方法:
     python convert_to_lerobot.py --input ./data --output ./lerobot_dataset --repo-id "dobot/teleop"
@@ -97,6 +98,9 @@ class HDF5ToLeRobotConverter:
         # Episode信息列表（用于生成episodes.jsonl）
         self.episodes_info = []
 
+        # 全局帧索引计数器（跨所有episode）
+        self.global_index = 0
+
     def scan_episodes(self):
         """扫描所有 episode_*.hdf5 文件"""
         episode_files = sorted(self.input_dir.glob("episode_*.hdf5"))
@@ -136,13 +140,40 @@ class HDF5ToLeRobotConverter:
             data['gripper_current'] = f['observations/gripper_current'][:]
             data['gripper_target'] = f['actions/gripper_target'][:]
 
-            # 读取时间戳
+            # 生成均匀时间戳（强制使用，确保 LeRobot 兼容性）
+            n_frames = len(data['robot_current'])
+
+            # 检查原始时间戳是否存在（仅用于诊断）
             if 'timestamp' in f:
-                data['timestamps'] = f['timestamp'][:]
+                original_timestamps = f['timestamp'][:]
+                dt = np.diff(original_timestamps)
+
+                # 检测时间戳问题
+                has_issues = False
+                if len(original_timestamps) != n_frames:
+                    print(f"  ⚠ Timestamp count mismatch: {len(original_timestamps)} vs {n_frames} frames")
+                    has_issues = True
+                elif np.all(original_timestamps == original_timestamps[0]):
+                    print(f"  ⚠ All timestamps identical: {original_timestamps[0]}")
+                    has_issues = True
+                elif np.any(dt < 0):
+                    print(f"  ⚠ Non-monotonic timestamps detected")
+                    has_issues = True
+                elif np.any(dt > 1.0 / self.fps * 1.5):
+                    max_gap = np.max(dt)
+                    print(f"  ⚠ Large time gaps detected: max {max_gap:.3f}s (expected ~{1.0/self.fps:.3f}s)")
+                    has_issues = True
+                elif np.any(dt == 0):
+                    print(f"  ⚠ Zero time intervals detected: {np.sum(dt == 0)} frames")
+                    has_issues = True
+
+                if has_issues:
+                    print(f"  → Using generated uniform timestamps for LeRobot compatibility")
             else:
-                # 如果没有时间戳，生成伪时间戳
-                n_frames = len(data['robot_current'])
-                data['timestamps'] = np.arange(n_frames) / self.fps
+                print(f"  ℹ No timestamps found in HDF5, generating uniform timestamps")
+
+            # 始终生成均匀时间戳（确保 LeRobot 兼容）
+            data['timestamps'] = np.arange(n_frames, dtype=np.float64) / self.fps
 
             # 读取相机内参
             if self.camera_intrinsics is None and 'camera/intrinsics' in f:
@@ -206,8 +237,11 @@ class HDF5ToLeRobotConverter:
             fps=self.fps
         )
 
-        # 2. 构建 observation.state (6D pose)
-        obs_state = episode_data['robot_current']  # (N, 6)
+        # 2. 构建 observation.state (7D: 6D pose + 1D gripper)
+        obs_state = np.concatenate([
+            episode_data['robot_current'],     # (N, 6)
+            episode_data['gripper_current']    # (N, 1)
+        ], axis=1)  # (N, 7)
 
         # 3. 构建 action (7D: 6D pose + 1D gripper)
         action = np.concatenate([
@@ -215,31 +249,26 @@ class HDF5ToLeRobotConverter:
             episode_data['gripper_target']     # (N, 1)
         ], axis=1)  # (N, 7)
 
-        # 4. 构建 observation.images.top (VideoFrame格式)
-        # VideoFrame需要包含: path (相对路径) 和 timestamp
         timestamps = episode_data['timestamps']
 
-        # 为每一帧创建VideoFrame结构
-        video_frames = []
-        for frame_idx in range(n_frames):
-            video_frames.append({
-                'path': video_rel_path,
-                'timestamp': float(timestamps[frame_idx])
-            })
-
-        # 5. 构建 next.done (标记episode结束)
+        # 4. 构建 next.done (标记episode结束)
         next_done = np.zeros(n_frames, dtype=bool)
         next_done[-1] = True  # 最后一帧标记为done
 
-        # 6. 创建 PyArrow Table
+        # 6. 构建全局索引（跨所有episode连续编号）
+        global_indices = list(range(self.global_index, self.global_index + n_frames))
+
+        # 7. 创建 PyArrow Table
+        # 注意: 不在Parquet中存储视频字段,LeRobot会根据info.json自动加载视频
         table_data = {
+            'index': pa.array(global_indices, type=pa.int64()),  # 全局索引
             'episode_index': pa.array([ep_idx] * n_frames, type=pa.int64()),
             'frame_index': pa.array(list(range(n_frames)), type=pa.int64()),
             'timestamp': pa.array(timestamps, type=pa.float64()),
+            'task_index': pa.array([0] * n_frames, type=pa.int64()),  # 所有数据属于任务0
 
-            # Observations
-            'observation.state': pa.array(obs_state.tolist(), type=pa.list_(pa.float32(), 6)),
-            'observation.images.top': pa.array(video_frames),  # VideoFrame结构
+            # Observations (只存储状态,不存储图像)
+            'observation.state': pa.array(obs_state.tolist(), type=pa.list_(pa.float32(), 7)),
 
             # Actions
             'action': pa.array(action.tolist(), type=pa.list_(pa.float32(), 7)),
@@ -250,14 +279,17 @@ class HDF5ToLeRobotConverter:
 
         table = pa.Table.from_pydict(table_data)
 
-        # 7. 保存为Parquet文件
+        # 8. 保存为Parquet文件
         parquet_filename = f"episode_{ep_idx:06d}.parquet"
         parquet_path = self.data_dir / parquet_filename
         parquet_path.parent.mkdir(parents=True, exist_ok=True)
 
         pq.write_table(table, parquet_path)
 
-        # 8. 记录episode信息（用于episodes.jsonl）
+        # 9. 更新全局索引计数器
+        self.global_index += n_frames
+
+        # 10. 记录episode信息（用于episodes.jsonl）
         episode_info = {
             'episode_index': ep_idx,
             'length': n_frames,
@@ -274,8 +306,14 @@ class HDF5ToLeRobotConverter:
         all_actions = []
 
         for episode_data in all_episodes_data:
-            all_obs_states.append(episode_data['robot_current'])
+            # 构建7D observation state (6D pose + 1D gripper)
+            obs_state = np.concatenate([
+                episode_data['robot_current'],
+                episode_data['gripper_current']
+            ], axis=1)
+            all_obs_states.append(obs_state)
 
+            # 构建7D action (6D pose + 1D gripper)
             action = np.concatenate([
                 episode_data['robot_target'],
                 episode_data['gripper_target']
@@ -302,13 +340,14 @@ class HDF5ToLeRobotConverter:
         保存 LeRobot v2.0 标准元数据
 
         包括:
-        - info.json: 数据集总体信息
+        - info.json: 数据集总体信息（不包含stats）
+        - stats.json: 数据集统计信息（独立文件）
         - episodes.jsonl: 每个episode的信息（每行一个JSON）
         - tasks.jsonl: 任务信息
         """
         self.meta_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. 保存 info.json
+        # 1. 保存 info.json（使用标准占位符格式）
         info = {
             'codebase_version': 'v2.0',
             'robot_type': self.robot_type,
@@ -316,24 +355,28 @@ class HDF5ToLeRobotConverter:
             'total_frames': total_frames,
             'chunks_size': 1000,  # LeRobot v2.0 必需字段：每个chunk的episode数量
             'fps': self.fps,
-            'repo_id': self.repo_id,
 
-            # 数据规范
-            'data_path': 'data/chunk-000',
-            'video_path': 'videos/chunk-000',
+            # 数据路径（使用标准占位符格式）
+            'data_path': 'data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet',
+            'video_path': 'videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4',
 
             # LeRobot 必需的 features 字段
             'features': {
+                'index': {
+                    'dtype': 'int64',
+                    'shape': [1],
+                    'names': None
+                },
                 'observation.state': {
                     'dtype': 'float32',
-                    'shape': [6],
-                    'names': ['x', 'y', 'z', 'rx', 'ry', 'rz']
+                    'shape': [7],
+                    'names': ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
                 },
                 'observation.images.top': {
                     'dtype': 'video',
                     'shape': [3, 480, 640],
                     'names': ['channel', 'height', 'width'],
-                    'info': {
+                    'video_info': {
                         'video.fps': self.fps,
                         'video.codec': self.video_codec,
                         'video.pix_fmt': 'yuv420p',
@@ -348,53 +391,30 @@ class HDF5ToLeRobotConverter:
                 },
                 'episode_index': {
                     'dtype': 'int64',
-                    'shape': [],
+                    'shape': [1],  # 标量字段使用 [1] 而不是 []
                     'names': None
                 },
                 'frame_index': {
                     'dtype': 'int64',
-                    'shape': [],
+                    'shape': [1],
                     'names': None
                 },
                 'timestamp': {
                     'dtype': 'float64',
-                    'shape': [],
+                    'shape': [1],
+                    'names': None
+                },
+                'task_index': {
+                    'dtype': 'int64',
+                    'shape': [1],
                     'names': None
                 },
                 'next.done': {
                     'dtype': 'bool',
-                    'shape': [],
+                    'shape': [1],
                     'names': None
                 }
             },
-
-            # 相机配置
-            'cameras': {
-                'observation.images.top': {
-                    'fps': self.fps,
-                    'width': 640,  # 根据实际数据调整
-                    'height': 480,
-                    'codec': self.video_codec,
-                }
-            },
-
-            # 相机内参
-            'camera_intrinsics': {
-                'observation.images.top': self.camera_intrinsics.tolist() if self.camera_intrinsics is not None else None
-            },
-
-            # 状态和动作空间（保留用于兼容性）
-            'observation_shapes': {
-                'observation.state': [6],  # (x, y, z, rx, ry, rz)
-                'observation.images.top': [480, 640, 3],  # (H, W, C)
-            },
-            'action_shape': [7],  # (x, y, z, rx, ry, rz, gripper)
-
-            # 统计信息
-            'stats': self.stats,
-
-            # 描述
-            'description': 'Dobot CR3 teleoperation dataset with 6D pose + gripper control',
         }
 
         info_path = self.meta_dir / "info.json"
@@ -402,14 +422,25 @@ class HDF5ToLeRobotConverter:
             json.dump(info, f, indent=2)
         print(f"✓ Saved info.json to {info_path}")
 
-        # 2. 保存 episodes.jsonl（每行一个JSON对象）
+        # 2. 保存 stats.json（独立文件）
+        stats_data = {
+            'observation.state': self.stats['observation.state'],
+            'action': self.stats['action']
+        }
+
+        stats_path = self.meta_dir / "stats.json"
+        with open(stats_path, 'w') as f:
+            json.dump(stats_data, f, indent=2)
+        print(f"✓ Saved stats.json to {stats_path}")
+
+        # 3. 保存 episodes.jsonl（每行一个JSON对象）
         episodes_path = self.meta_dir / "episodes.jsonl"
         with open(episodes_path, 'w') as f:
             for ep_info in self.episodes_info:
                 f.write(json.dumps(ep_info) + '\n')
         print(f"✓ Saved episodes.jsonl to {episodes_path}")
 
-        # 3. 保存 tasks.jsonl（任务描述）
+        # 4. 保存 tasks.jsonl（任务描述）
         tasks = [
             {
                 'task_index': 0,
@@ -444,9 +475,22 @@ Converted to LeRobot v2.0 format using the standard any4lerobot converter.
 
 ```
 dataset/
-├── data/chunk-000/          # Parquet files (one per episode)
-├── videos/chunk-000/        # MP4 videos (one per episode per camera)
-└── meta/                    # Metadata (info.json, episodes.jsonl, tasks.jsonl)
+├── data/
+│   └── chunk-000/              # Parquet files (one per episode)
+│       ├── episode_000000.parquet
+│       ├── episode_000001.parquet
+│       └── ...
+├── videos/
+│   └── chunk-000/              # MP4 videos (one per episode per camera)
+│       └── observation.images.top/
+│           ├── episode_000000.mp4
+│           ├── episode_000001.mp4
+│           └── ...
+└── meta/                       # Metadata files
+    ├── info.json               # Dataset information and schema
+    ├── stats.json              # Statistics (min/max/mean/std)
+    ├── episodes.jsonl          # Per-episode metadata
+    └── tasks.jsonl             # Task descriptions
 ```
 
 ## Observation Space
@@ -550,7 +594,7 @@ Generated with HDF5 to LeRobot v2.0 converter (any4lerobot compatible)
         total_frames = 0
 
         for episode_data in tqdm(all_episodes_data, desc="Converting to Parquet"):
-            parquet_path, video_path, episode_info = self.convert_episode_to_parquet(episode_data)
+            _, _, episode_info = self.convert_episode_to_parquet(episode_data)
             self.episodes_info.append(episode_info)
             total_frames += episode_info['length']
 
@@ -570,6 +614,10 @@ Generated with HDF5 to LeRobot v2.0 converter (any4lerobot compatible)
         print(f"  - Parquet files: {self.data_dir}")
         print(f"  - Video files: {self.videos_dir}")
         print(f"  - Metadata: {self.meta_dir}")
+        print(f"    ├── info.json    (dataset schema)")
+        print(f"    ├── stats.json   (statistics)")
+        print(f"    ├── episodes.jsonl")
+        print(f"    └── tasks.jsonl")
         print()
         print("To use with LeRobot:")
         print(f"  from lerobot.common.datasets.lerobot_dataset import LeRobotDataset")

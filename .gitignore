@@ -35,3 +35,11 @@ dobot_demo/dobot_demo/convert/data/episode_2.hdf5
 dobot_demo/dobot_demo/convert/dataset_preview/episode_000_frame_000.jpg
 dobot_demo/dobot_demo/convert/dataset_preview/episode_001_frame_000.jpg
 dobot_demo/dobot_demo/convert/dataset_preview/episode_002_frame_000.jpg
+dobot_demo/dobot_demo/convert/vla_dataset/.gitattributes
+dobot_demo/dobot_demo/convert/vla_dataset/data/chunk-000/file-000.parquet
+dobot_demo/dobot_demo/convert/vla_dataset/meta/info.json
+dobot_demo/dobot_demo/convert/vla_dataset/meta/stats.json
+dobot_demo/dobot_demo/convert/vla_dataset/meta/tasks.parquet
+dobot_demo/dobot_demo/convert/vla_dataset/meta/episodes/chunk-000/file-000.parquet
+dobot_demo/dobot_demo/convert/vla_dataset/videos/observation.image/chunk-000/file-000.mp4
+dobot_demo/dobot_demo/convert/lerobot_dataset/meta/stats.json
