@@ -42,4 +42,7 @@ dobot_demo/dobot_demo/convert/vla_dataset/meta/stats.json
 dobot_demo/dobot_demo/convert/vla_dataset/meta/tasks.parquet
 dobot_demo/dobot_demo/convert/vla_dataset/meta/episodes/chunk-000/file-000.parquet
 dobot_demo/dobot_demo/convert/vla_dataset/videos/observation.image/chunk-000/file-000.mp4
-dobot_demo/dobot_demo/convert/lerobot_dataset/meta/stats.json
+dobot_demo/dobot_demo/convert/lerobot_dataset/*
+dobot_demo/dobot_demo/convert/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000000.mp4
+dobot_demo/dobot_demo/convert/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000001.mp4
+dobot_demo/dobot_demo/convert/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000002.mp4

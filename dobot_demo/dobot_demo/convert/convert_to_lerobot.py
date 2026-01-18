@@ -83,7 +83,7 @@ class HDF5ToLeRobotConverter:
 
         # 创建标准目录结构
         self.data_dir = self.output_dir / "data" / "chunk-000"
-        self.videos_dir = self.output_dir / "videos" / "chunk-000"
+        self.videos_dir = self.output_dir / "videos" / "observation.images.top" / "chunk-000"
         self.meta_dir = self.output_dir / "meta"
 
         # 统计信息
@@ -233,7 +233,7 @@ class HDF5ToLeRobotConverter:
         video_filename = f"episode_{ep_idx:06d}.mp4"
         video_rel_path = self.create_video_from_images(
             episode_data['images'],
-            self.videos_dir / "observation.images.top" / video_filename,
+            self.videos_dir / video_filename,
             fps=self.fps
         )
 
@@ -353,12 +353,20 @@ class HDF5ToLeRobotConverter:
             'robot_type': self.robot_type,
             'total_episodes': total_episodes,
             'total_frames': total_frames,
+            'total_tasks': 1,  # HuggingFace 需要：任务总数
+            'total_videos': total_episodes,  # HuggingFace 需要：视频总数
+            'total_chunks': 1,  # HuggingFace 需要：chunk总数
             'chunks_size': 1000,  # LeRobot v2.0 必需字段：每个chunk的episode数量
             'fps': self.fps,
 
+            # HuggingFace 需要：数据集划分信息
+            'splits': {
+                'train': f'0:{total_episodes}'
+            },
+
             # 数据路径（使用标准占位符格式）
             'data_path': 'data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet',
-            'video_path': 'videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4',
+            'video_path': 'videos/{video_key}/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.mp4',
 
             # LeRobot 必需的 features 字段
             'features': {
@@ -456,7 +464,20 @@ class HDF5ToLeRobotConverter:
 
     def generate_readme(self, total_episodes, total_frames):
         """生成README文件"""
-        readme_content = f"""# {self.repo_id}
+        readme_content = f"""---
+license: mit
+task_categories:
+- robotics
+tags:
+- LeRobot
+- Dobot
+- teleoperation
+configs:
+- config_name: default
+  data_files: data/*/*.parquet
+---
+
+# {self.repo_id}
 
 ## Dataset Description
 
@@ -481,8 +502,8 @@ dataset/
 │       ├── episode_000001.parquet
 │       └── ...
 ├── videos/
-│   └── chunk-000/              # MP4 videos (one per episode per camera)
-│       └── observation.images.top/
+│   └── observation.images.top/    # Camera view
+│       └── chunk-000/              # MP4 videos (one per episode)
 │           ├── episode_000000.mp4
 │           ├── episode_000001.mp4
 │           └── ...
