@@ -36,7 +36,7 @@ class adderServer(Node):
         self.srv = self.create_service(GetInBits,'/dobot_bringup_v3/srv/GetInBits',self.GetInBits)
         self.srv = self.create_service(GetInRegs,'/dobot_bringup_v3/srv/GetInRegs',self.GetInRegs)
         self.srv = self.create_service(GetPose,'/dobot_bringup_v3/srv/GetPose',self.GetPose)
-        # self.srv = self.create_service(InverseSolution,'/dobot_bringup_v3/srv/InverseSolution',self.InverseSolution)
+        self.srv = self.create_service(InverseSolution,'/dobot_bringup_v3/srv/InverseSolution',self.InverseSolution)
         # self.srv = self.create_service(LimZ,'/dobot_bringup_v3/srv/LimZ',self.LimZ)
         # self.srv = self.create_service(LoadSwitch,'/dobot_bringup_v3/srv/LoadSwitch',self.LoadSwitch)
         self.srv = self.create_service(ModbusClose,'/dobot_bringup_v3/srv/ModbusClose',self.ModbusClose)
@@ -94,6 +94,14 @@ class adderServer(Node):
            self.get_logger().info("connection succeeded:29999,30003")
         except:
             self.get_logger().info("Connection failed!!!")
+    
+    def InverseSolution(self, request, response):
+        return_t = self.dashboard.InverseSolution(request.offset1,request.offset2,request.offset3,request.offset4,request.offset5,request.offset6,request.user,request.tool)
+        return_tt = return_t[:return_t.find("{")-1]
+        response.res = int(return_tt)   
+        response.pos = return_t[return_t.find("{"):return_t.find("}")+1]                                         
+        self.get_logger().info(return_t)                                        
+        return response 
 
     def EnableRobot(self, request, response):                                           # 创建回调函数，执行收到请求后对数据的处理
         return_t = self.dashboard.EnableRobot([request.load])
