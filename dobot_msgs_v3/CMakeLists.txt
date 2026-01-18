@@ -26,6 +26,7 @@ find_package(builtin_interfaces REQUIRED)
 set(msg_files
         "msg/RobotStatus.msg"
         "msg/ToolVectorActual.msg"
+        "msg/ToolVectorTarget.msg"
         )
 
 set(srv_files

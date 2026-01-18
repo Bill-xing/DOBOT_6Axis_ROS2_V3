@@ -4,11 +4,14 @@
 import rclpy                                     # ROS2 Python接口库
 from rclpy.node import Node                      
 from dobot_msgs_v3.msg import ToolVectorActual
+from dobot_msgs_v3.msg import ToolVectorTarget
 from sensor_msgs.msg import JointState  
 import socket
 import numpy as np
 import os
 import time
+
+# 数据结构定义保持不变
 MyType = np.dtype([('len',np.int64,), ('digital_input_bits',np.uint64,), ('digital_output_bits',
     np.uint64,), ('robot_mode',np.uint64,), ('time_stamp',np.uint64,), ( 'time_stamp_reserve_bit', np.uint64,),
     ('test_value',np.uint64,), ('test_value_keep_bit', np.float64,), ('speed_scaling',np.float64,), ('linear_momentum_norm',np.float64,),
@@ -75,9 +78,6 @@ MyType = np.dtype([('len',np.int64,), ('digital_input_bits',np.uint64,), ('digit
     ('reserve3',np.int8, (24,))
      ])
 
-
-
-
 class fankuis():
     def __init__(self, ip, port):
         self.ip = ip
@@ -93,31 +93,32 @@ class fankuis():
     
     def feed(self):
         try:
-            self.socket_feedback.setblocking(True)  # 需要先设置为非阻塞, 使用select超时机制清空
+            self.socket_feedback.setblocking(True) 
             self.all = self.socket_feedback.recv(10240)
             data = self.all[0:1440]
             a = np.frombuffer(data, dtype=MyType)
             if hex((a['test_value'][0])) == '0x123456789abcdef':
                 tool_v = a['tool_vector_actual'][0]
+                tool_t = a['Tool_vector_target'][0]
                 tool_j = a['q_actual'][0]
-            return [tool_v,tool_j]
+            return [tool_v, tool_j, tool_t]
         except:
             return ["NG1"]
 
-"""
-创建一个发布者节点
-"""
 class PublisherNode(Node):
     
     def __init__(self, name):
         super().__init__(name)                                    
-        # self.declare_parameter('IP', '192.168.5.1')  # 默认值
-        # self.IP = self.get_parameter('IP').get_parameter_value().string_value
         self.IP = str(os.getenv("IP_address"))
         self.connect()
+        # 初始化发布器
         self.pub = self.create_publisher(ToolVectorActual, "dobot_msgs_v3/msg/ToolVectorActual", 10)
         self.pub2 = self.create_publisher(JointState, "joint_states_robot", 10)
+        # 补全 ToolVectorTarget 发布器
+        self.pub3 = self.create_publisher(ToolVectorTarget, "dobot_msgs_v3/msg/ToolVectorTarget", 10)
+        
         self.timer = self.create_timer(0.01, self.timer_callback)
+
     def connect(self):
         try:
            self.get_logger().info("connection:30004")
@@ -125,34 +126,51 @@ class PublisherNode(Node):
            self.get_logger().info("connection succeeded:30004")
         except:
             self.get_logger().info("Connection failed!!!")
-    def timer_callback(self):
-        msg = ToolVectorActual()
-        actual = self.feed_v.feed()
-        msg2 = JointState()
-        #self.get_logger().info(str(actual))
-        if len(actual)!= 1:
-           # 添加时间戳
-           current_time = self.get_clock().now().to_msg()
-           msg.header.stamp = current_time
-           msg.header.frame_id = 'base_link'
 
-           msg2.name = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
-           msg2.header.stamp = current_time
-           msg2.header.frame_id = 'joint_states'
-           q_target = actual[1]
-           joint_a = []
-           for ii in q_target:
-               joint_a.append(float(ii*3.14159/180))
-           print(joint_a)
-           msg2.position = joint_a
-           msg.x = actual[0][0]
-           msg.y = actual[0][1]
-           msg.z = actual[0][2]
-           msg.rx = actual[0][3]
-           msg.ry = actual[0][4]
-           msg.rz =actual[0][5]
-           self.pub.publish(msg)
-           self.pub2.publish(msg2) 
+    def timer_callback(self):
+        actual = self.feed_v.feed()
+        
+        if len(actual) != 1:
+            current_time = self.get_clock().now().to_msg()
+            
+            # 1. 处理 ToolVectorActual (msg)
+            msg = ToolVectorActual()
+            msg.header.stamp = current_time
+            msg.header.frame_id = 'base_link'
+            msg.x = actual[0][0]
+            msg.y = actual[0][1]
+            msg.z = actual[0][2]
+            msg.rx = actual[0][3]
+            msg.ry = actual[0][4]
+            msg.rz = actual[0][5]
+
+            # 2. 处理 JointState (msg2)
+            msg2 = JointState()
+            msg2.name = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+            msg2.header.stamp = current_time
+            msg2.header.frame_id = 'joint_states'
+            q_actual_val = actual[1]
+            joint_a = []
+            for ii in q_actual_val:
+                joint_a.append(float(ii * 3.14159 / 180))
+            msg2.position = joint_a
+
+            # 3. 补全 ToolVectorTarget (msg3)
+            # 这里的格式与 ToolVectorActual 完全一致，数据取自 actual[2] (即 tool_t)
+            msg3 = ToolVectorTarget()
+            msg3.header.stamp = current_time
+            msg3.header.frame_id = 'base_link'
+            msg3.x = actual[2][0]
+            msg3.y = actual[2][1]
+            msg3.z = actual[2][2]
+            msg3.rx = actual[2][3]
+            msg3.ry = actual[2][4]
+            msg3.rz = actual[2][5]
+
+            # 发布所有消息
+            self.pub.publish(msg)
+            self.pub2.publish(msg2) 
+            self.pub3.publish(msg3)
         
 def main(args=None):
     rclpy.init(args=args)
@@ -160,3 +178,6 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

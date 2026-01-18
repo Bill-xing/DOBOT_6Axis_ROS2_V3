@@ -1,5 +1,7 @@
 # 顶部相机 精度1cm之内
 # 两点， 包含抓取方向
+# [修改版] 集成 VLA 数据转发功能
+
 import rclpy
 from rclpy.node import Node
 import cv2
@@ -14,6 +16,8 @@ import sys
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Int32
 from dobot_msgs_v3.srv import *
+# [新增] 引入用于数据转发的消息类型
+from dobot_msgs_v3.msg import ToolVectorActual, ToolVectorTarget
 
 # ================= 1. 视觉标定类 (保持不变) =================
 class RobotVisionSystem:
@@ -128,7 +132,7 @@ class Camera8KDriver:
     def release(self):
         self.cap.release()
 
-# ================= 3. Dobot ROS2 Wrapper (新增逆解功能) =================
+# ================= 3. Dobot ROS2 Wrapper (核心修改：数据桥接) =================
 class DobotRosWrapper(Node):
     def __init__(self, node_name="click_pair_pick"):
         super().__init__(node_name)
@@ -141,7 +145,7 @@ class DobotRosWrapper(Node):
         self.cli_servo_p = self.create_client(ServoP, '/dobot_bringup_v3/srv/ServoP')
         self.cli_sync = self.create_client(Sync, '/dobot_bringup_v3/srv/Sync')
         
-        # === 新增 InverseSolution 客户端 ===
+        # 逆解客户端
         self.cli_inverse = self.create_client(InverseSolution, '/dobot_bringup_v3/srv/InverseSolution')
 
         # Modbus
@@ -150,14 +154,50 @@ class DobotRosWrapper(Node):
         self.cli_set_hold_regs = self.create_client(SetHoldRegs, '/dobot_bringup_v3/srv/SetHoldRegs')
         self.cli_get_hold_regs = self.create_client(GetHoldRegs, '/dobot_bringup_v3/srv/GetHoldRegs')
 
-        # === 发布器：夹爪状态 & 录制控制 ===
+        # === 1. 录制器交互话题 ===
+        # 夹爪相关
         self.pub_gripper_update = self.create_publisher(PointStamped, "/gripper/command_update", 5)
         self.pub_gripper_state = self.create_publisher(PointStamped, "/gripper/state_feedback", 5)
+        # 录制控制
         self.pub_record_cmd = self.create_publisher(Int32, "/recorder/command", 10)
+
+        # === 2. 机械臂 Target 数据桥接 (Bridge) ===
+        # 订阅：来自底层反馈节点的硬件目标
+        self.sub_hardware_target = self.create_subscription(
+            ToolVectorTarget, 
+            '/dobot_msgs_v3/msg/ToolVectorTarget', 
+            self.relay_target_callback, 
+            10
+        )
+        # 发布：给录制器使用的统一 Target 话题
+        self.pub_recorder_target = self.create_publisher(
+            ToolVectorActual, 
+            '/robot/target_pose', 
+            10
+        )
 
         # 检查服务
         if not self.cli_inverse.wait_for_service(timeout_sec=2.0):
             self.get_logger().warn("Warning: InverseSolution service not available!")
+
+    def relay_target_callback(self, msg):
+        """
+        [关键] 将底层反馈的 ToolVectorTarget 转换为录制器需要的 ToolVectorActual 格式
+        并发布到 /robot/target_pose。
+        这样，无论视觉脚本如何通过服务控制机器人，录制器都能收到真实的硬件目标位姿。
+        """
+        relay_msg = ToolVectorActual()
+        # 复制所有字段
+        relay_msg.header = msg.header
+        relay_msg.x = msg.x
+        relay_msg.y = msg.y
+        relay_msg.z = msg.z
+        relay_msg.rx = msg.rx
+        relay_msg.ry = msg.ry
+        relay_msg.rz = msg.rz
+        
+        # 转发给录制器
+        self.pub_recorder_target.publish(relay_msg)
 
     def call_service(self, client, request):
         if not client.service_is_ready(): return None
@@ -169,37 +209,15 @@ class DobotRosWrapper(Node):
         if client.service_is_ready(): client.call_async(request)
 
     def check_accessibility(self, x, y, z, rx, ry, rz):
-        """
-        调用 InverseSolution 验证点位是否可达
-        
-        Returns:
-            bool: True 可达, False 不可达
-        """
         if not self.cli_inverse.service_is_ready():
             print("Error: Inverse service not ready, skipping check (assuming risky true)")
-            return True # 如果服务没启动，为了不卡死，暂时返回True(但在生产环境应该返回False)
-
+            return True 
         req = InverseSolution.Request()
-        req.offset1 = float(x)
-        req.offset2 = float(y)
-        req.offset3 = float(z)
-        req.offset4 = float(rx)
-        req.offset5 = float(ry)
-        req.offset6 = float(rz)
-        req.user = 0  # 默认用户坐标系
-        req.tool = 0  # 默认工具坐标系
-        req.is_jointnear = 0 # 自动选解
-        req.joint_near = "" 
-
+        req.offset1, req.offset2, req.offset3 = float(x), float(y), float(z)
+        req.offset4, req.offset5, req.offset6 = float(rx), float(ry), float(rz)
+        req.user = 0; req.tool = 0; req.is_jointnear = 0; req.joint_near = "" 
         res = self.call_service(self.cli_inverse, req)
-        
-        # Dobot V3 协议中，通常 res (或错误码) 为 0 表示成功
-        # 具体字段请参考实际srv定义，这里假设 res 为 ErrorID 字段
-        # 如果 res.res == 0 表示逆解成功
-        if res is not None and res.res == 0:
-            return True
-        else:
-            return False
+        return True if (res is not None and res.res == 0) else False
 
 class GripperManager(threading.Thread):
     def __init__(self, wrapper):
@@ -218,10 +236,7 @@ class GripperManager(threading.Thread):
                 self.wrapper.call_service(self.wrapper.cli_modbus_close, req)
             
             req = ModbusCreate.Request()
-            req.ip = "127.0.0.1"
-            req.port = 60000
-            req.slave_id = 1
-            req.is_rtu = 1
+            req.ip = "127.0.0.1"; req.port = 60000; req.slave_id = 1; req.is_rtu = 1
             res = self.wrapper.call_service(self.wrapper.cli_modbus_create, req)
             if res and res.res == 0:
                 match = re.search(r'(\d+)', str(res.index))
@@ -234,10 +249,7 @@ class GripperManager(threading.Thread):
     def write_reg(self, addr, count, val_str, wait=False):
         if self.id <= 0: return
         req = SetHoldRegs.Request()
-        req.index = self.id
-        req.addr = addr
-        req.count = count
-        req.val_tab = val_str
+        req.index = self.id; req.addr = addr; req.count = count; req.val_tab = val_str
         if wait: self.wrapper.call_service(self.wrapper.cli_set_hold_regs, req)
         else: self.wrapper.call_service_async_no_wait(self.wrapper.cli_set_hold_regs, req)
 
@@ -251,8 +263,7 @@ class GripperManager(threading.Thread):
 
 class GripperStateFeedback(threading.Thread):
     """
-    独立的夹爪状态反馈线程
-    专门负责定期读取夹爪实际位置并发布当前状态和目标状态
+    独立的夹爪状态反馈线程 (完美配合录制器)
     使用高频发布(100Hz)+低频采样(10Hz)+基于时间的线性插补
     """
     def __init__(self, wrapper, gripper_manager):
@@ -260,160 +271,98 @@ class GripperStateFeedback(threading.Thread):
         self.wrapper = wrapper
         self.gripper_manager = gripper_manager
         self.running = True
-
-        # 频率设置
-        self.feedback_rate = 100.0  # 发布频率 100Hz
-        self.modbus_read_rate = 10.0  # Modbus实际读取频率 10Hz
-        self.read_interval = 1.0 / self.modbus_read_rate  # 读取间隔 0.1秒
-
-        # 插补所需的状态变量（基于时间戳）
+        self.feedback_rate = 100.0
+        self.modbus_read_rate = 10.0
+        self.read_interval = 1.0 / self.modbus_read_rate
         self.last_read_time = time.time()
-
-        # 当前状态插补
-        self.last_real_pos = None
-        self.current_real_pos = None
-        self.last_real_read_time = None
-        self.current_real_read_time = None
-
-        # 目标状态插补
-        self.last_target_pos = None
-        self.current_target_pos = None
-        self.last_target_read_time = None
-        self.current_target_read_time = None
+        self.last_real_pos = None; self.current_real_pos = None
+        self.last_real_read_time = None; self.current_real_read_time = None
+        self.last_target_pos = None; self.current_target_pos = None
+        self.last_target_read_time = None; self.current_target_read_time = None
 
     def _interpolate(self, last_val, current_val, last_time, current_time, now):
-        """
-        基于时间的线性插补
-        """
-        if last_val is None or current_val is None:
-            return current_val if current_val is not None else 0.0
-
-        if last_time is None or current_time is None:
-            return current_val
-
-        # 计算插补系数
+        if last_val is None or current_val is None: return current_val if current_val is not None else 0.0
+        if last_time is None or current_time is None: return current_val
         time_span = current_time - last_time
-        if time_span <= 0:
-            return current_val
-
+        if time_span <= 0: return current_val
         elapsed = now - last_time
-        alpha = min(1.0, elapsed / time_span)  # 限制在 [0, 1]
-
-        # 线性插补
+        alpha = min(1.0, elapsed / time_span)
         return last_val + alpha * (current_val - last_val)
 
     def read_gripper_position(self):
-        """读取夹爪实际位置（寄存器514）"""
-        if self.gripper_manager.id <= 0:
-            return None
+        if self.gripper_manager.id <= 0: return None
         try:
             req = GetHoldRegs.Request()
-            req.index = self.gripper_manager.id
-            req.addr = 514
-            req.count = 1
+            req.index = self.gripper_manager.id; req.addr = 514; req.count = 1
             res = self.wrapper.call_service(self.wrapper.cli_get_hold_regs, req)
-            if res and res.res == 0:
-                return int(res.value)
-        except:
-            pass
+            if res and res.res == 0: return int(res.value)
+        except: pass
         return None
 
     def run(self):
-        """
-        核心循环：以100Hz频率发布夹爪状态（当前+目标），使用基于时间的线性插补
-        """
         while self.running:
             try:
                 now = time.time()
                 timestamp = self.wrapper.get_clock().now().to_msg()
 
-                # === 每0.1秒读取一次真实值 ===
                 if now - self.last_read_time >= self.read_interval:
                     self.last_read_time = now
-
-                    # 读取夹爪实际位置
                     real_pos = self.read_gripper_position()
                     if real_pos is not None:
                         self.last_real_pos = self.current_real_pos
                         self.last_real_read_time = self.current_real_read_time
-
                         self.current_real_pos = float(real_pos)
                         self.current_real_read_time = now
 
-                    # 目标位置 = 控制指令
                     target = self.gripper_manager.target_pos
-
                     self.last_target_pos = self.current_target_pos
                     self.last_target_read_time = self.current_target_read_time
-
                     self.current_target_pos = target
                     self.current_target_read_time = now
 
-                # === 基于时间的线性插补计算 ===
-                interpolated_current = self._interpolate(
-                    self.last_real_pos,
-                    self.current_real_pos,
-                    self.last_real_read_time,
-                    self.current_real_read_time,
-                    now
-                )
+                interpolated_current = self._interpolate(self.last_real_pos, self.current_real_pos,
+                                                         self.last_real_read_time, self.current_real_read_time, now)
+                interpolated_target = self._interpolate(self.last_target_pos, self.current_target_pos,
+                                                        self.last_target_read_time, self.current_target_read_time, now)
 
-                interpolated_target = self._interpolate(
-                    self.last_target_pos,
-                    self.current_target_pos,
-                    self.last_target_read_time,
-                    self.current_target_read_time,
-                    now
-                )
-
-                # === 发布插补后的状态（100Hz）===
                 # 发布当前状态
                 msg_current = PointStamped()
                 msg_current.header.stamp = timestamp
                 msg_current.header.frame_id = "gripper_feedback"
                 msg_current.point.x = float(interpolated_current)
-                msg_current.point.y = 0.0
-                msg_current.point.z = 0.0
                 self.wrapper.pub_gripper_state.publish(msg_current)
 
-                # 发布目标状态
+                # 发布目标状态 (Command)
                 msg_target = PointStamped()
                 msg_target.header.stamp = timestamp
                 msg_target.header.frame_id = "gripper_command"
                 msg_target.point.x = float(interpolated_target)
-                msg_target.point.y = 0.0
-                msg_target.point.z = 0.0
                 self.wrapper.pub_gripper_update.publish(msg_target)
 
-            except Exception as e:
-                # 避免异常导致线程崩溃
-                print(f"[ERROR] GripperStateFeedback: {e}")
-
-            # 控制循环频率 100Hz
+            except Exception as e: print(f"[ERROR] GripperFeedback: {e}")
             time.sleep(1.0 / self.feedback_rate)
 
-# ================= 4. 主程序 (集成逆解验证) =================
+# ================= 4. 主程序 (集成逆解验证与数据采集桥接) =================
 
-V_Z1 = 212.0  # 抓取高度 (重点验证高度)
-V_Z2 = 250.0  # 安全高度
+V_Z1 = 212.0
+V_Z2 = 250.0
 GRIPPER_OPEN = 600.0
 GRIPPER_CLOSE = 0.0
 V_SPEED_UP = 0.1
 V_RG = 80.0
 DEFAULT_POSE = [383.0, -61.0, V_Z2, 180.0, 0.0, 90.0]
-# DEFAULT_POSE = [120.0, -243.0, V_Z2, 180.0, 0.0, 90.0]
 
 class AutoPickApp:
     def __init__(self):
         rclpy.init()
         self.node = DobotRosWrapper()
+        # ROS 必须在后台 Spin 以接收硬件反馈并转发
         self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
         self.spin_thread.start()
 
         self.gripper = GripperManager(self.node)
         self.gripper.start()
 
-        # [新增] 启动独立的夹爪状态反馈线程
         self.gripper_feedback = GripperStateFeedback(self.node, self.gripper)
         self.gripper_feedback.start()
 
@@ -430,7 +379,7 @@ class AutoPickApp:
         self.running = True
         self.robot_busy = False
         self.stop_flag = False
-        self.window_name = "8K Verified Pick"
+        self.window_name = "8K Verified Pick (Recorder Bridge Mode)"
         
         self.click_state = 0 
         self.pt1_uv = None
@@ -465,96 +414,60 @@ class AutoPickApp:
         self.click_state = 0
 
     def find_reachable_rz(self, x, y, z, original_rz):
-        """
-        寻找可行的 Rz 角度。
-        策略：原值 -> ±180(mod 360) -> ±90(mod 360)
-        """
         rx_def = DEFAULT_POSE[3]
         ry_def = DEFAULT_POSE[4]
-        
-        # 候选列表：(角度值, 描述)
-        candidates = []
-        
-        # 1. 原始计算角度
-        candidates.append((original_rz, "Original"))
-        
-        # 2. +/- 180 度 (同方向抓取，关节不同)
-        # 注意: (ang + 180) % 360 可能会产生正值，如果要测试负值范围，需要特殊处理
-        # 这里统一转到 0-360 或者 -180~180。Dobot Inverse 通常接受宽松范围。
-        candidates.append(((original_rz + 180) % 360, "+180"))
-        candidates.append(((original_rz - 180) % 360, "-180"))
-        
-        # 3. +/- 90 度 (垂直方向抓取，仅在上述失败时尝试)
-        candidates.append(((original_rz + 90) % 360, "+90"))
-        candidates.append(((original_rz - 90) % 360, "-90"))
-
-        print(f"--- 开始可达性验证 (Pos: {x:.1f}, {y:.1f}, {z:.1f}) ---")
-        
+        candidates = [
+            (original_rz, "Original"),
+            ((original_rz + 180) % 360, "+180"),
+            ((original_rz - 180) % 360, "-180"),
+            ((original_rz + 90) % 360, "+90"),
+            ((original_rz - 90) % 360, "-90")
+        ]
+        print(f"--- 验证可达性 (Pos: {x:.1f}, {y:.1f}, {z:.1f}) ---")
         for rz_test, tag in candidates:
-            # 验证逆解
-            is_reachable = self.node.check_accessibility(x, y, z, rx_def, ry_def, rz_test)
-            
-            if is_reachable:
-                print(f"√ 方案可行 [{tag}]: Rz = {rz_test:.2f}")
+            if self.node.check_accessibility(x, y, z, rx_def, ry_def, rz_test):
+                print(f"√ 可行 [{tag}]: Rz = {rz_test:.2f}")
                 return rz_test
-            else:
-                print(f"X 方案不可行 [{tag}]: Rz = {rz_test:.2f}")
-        
         return None
 
     def execution_thread(self, target_pos_mm, target_angle):
-        """执行抓取动作"""
         if self.robot_busy: return
         self.robot_busy = True
         self.stop_flag = False
-        
         tx, ty = target_pos_mm
         
-        # === 步骤 0: 可达性验证 (重点) ===
-        # 我们验证抓取底部的点 (V_Z1)，因为这是约束最严格的点
         valid_rz = self.find_reachable_rz(tx, ty, V_Z1, target_angle)
-        print(f"验证结果 Rz: {valid_rz}")
-        
         if valid_rz is None:
-            print(">>> [错误] 目标点无法到达 (所有角度尝试均失败) <<<")
+            print(">>> [错误] 目标点无法到达")
             self.robot_busy = False
             return
         
-        # 使用验证过的 Rz
         print(f">>> 执行抓取: X={tx:.1f}, Y={ty:.1f}, Valid_Rz={valid_rz:.1f}°")
-
         try:
-            # 1. 移动到上方 (V_Z2) + 旋转
+            # 1. 移动到上方 (V_Z2)
             if self.stop_flag: raise InterruptedError()
             self.gripper.set_target(GRIPPER_OPEN)
-            
             req = MovJ.Request()
             req.x, req.y, req.z = float(tx), float(ty), float(V_Z2)
-            req.rx, req.ry = DEFAULT_POSE[3], DEFAULT_POSE[4]
-            req.rz = float(valid_rz) # 使用验证过的角度
-            
+            req.rx, req.ry, req.rz = DEFAULT_POSE[3], DEFAULT_POSE[4], float(valid_rz)
             self.node.call_service(self.node.cli_mov_j, req)
             self.node.call_service(self.node.cli_sync, Sync.Request())
 
-            # 2. 下降 (V_Z1) - 这里因为已经验证过，理论上是安全的
+            # 2. 下降 (V_Z1)
             req = MovL.Request()
             req.x, req.y, req.z = float(tx), float(ty), float(V_Z2)
-            req.rx, req.ry = DEFAULT_POSE[3], DEFAULT_POSE[4]
-            req.rz = float(valid_rz) # 使用验证过的角度
-
+            req.rx, req.ry, req.rz = DEFAULT_POSE[3], DEFAULT_POSE[4], float(valid_rz)
             if self.stop_flag: raise InterruptedError()
             req.z = float(V_Z1)
             self.node.call_service(self.node.cli_mov_l, req)
             self.node.call_service(self.node.cli_sync, Sync.Request())
 
-            # 3. 动态抓取
+            # 3. 动态抓取 (ServoP 模拟)
             print(">>> 闭合夹爪并上升...")
             current_z = V_Z1
             current_grip = GRIPPER_OPEN
-            
             while current_z < V_Z2:
                 if self.stop_flag: raise InterruptedError()
-                
                 current_z += V_SPEED_UP
                 current_grip -= V_RG
                 if current_z > V_Z2: current_z = V_Z2
@@ -562,8 +475,7 @@ class AutoPickApp:
                 
                 sp_req = ServoP.Request()
                 sp_req.x, sp_req.y, sp_req.z = float(tx), float(ty), float(current_z)
-                sp_req.rx, sp_req.ry = DEFAULT_POSE[3], DEFAULT_POSE[4]
-                sp_req.rz = float(valid_rz) 
+                sp_req.rx, sp_req.ry, sp_req.rz = DEFAULT_POSE[3], DEFAULT_POSE[4], float(valid_rz)
                 self.node.call_service_async_no_wait(self.node.cli_servo_p, sp_req)
                 
                 self.gripper.set_target(current_grip)
@@ -573,11 +485,10 @@ class AutoPickApp:
             self.gripper.set_target(GRIPPER_OPEN)
             time.sleep(0.5)
 
-        except InterruptedError:
-            print("Action Interrupted")
+        except InterruptedError: print("Action Interrupted")
         except Exception as e:
             print(f"Action Error: {e}")
-            self.stop_robot() # 出错时清除错误
+            self.stop_robot()
         finally:
             self.robot_busy = False
             print(">>> 回归原点")
@@ -585,9 +496,7 @@ class AutoPickApp:
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            if self.robot_busy:
-                print("Robot is Busy!")
-                return
+            if self.robot_busy: return
             
             scale_w = 8160 / 1280
             scale_h = 6120 / 960
@@ -599,36 +508,31 @@ class AutoPickApp:
                 self.pt1_real = (real_u, real_v)
                 self.click_state = 1
                 print(f"[Click 1] 抓取点: ({x}, {y})")
-                
             elif self.click_state == 1:
                 print(f"[Click 2] 方向点: ({x}, {y})")
                 result = self.vision.pixel_pair_to_robot_pose(
-                    self.pt1_real[0], self.pt1_real[1],
-                    real_u, real_v,
-                    z_offset_mm=0
+                    self.pt1_real[0], self.pt1_real[1], real_u, real_v, z_offset_mm=0
                 )
                 self.click_state = 0
                 self.pt1_uv = None
                 
                 if result is not None:
                     (rx, ry), angle = result
-                    # 启动线程
                     t = threading.Thread(target=self.execution_thread, args=((rx, ry), angle))
                     t.start()
-                else:
-                    print("解算失败")
+                else: print("解算失败")
 
     def run(self):
-        print("\n=== 验证版抓取程序（集成数据采集）===")
-        print("  包含关节限位检测与自动换向逻辑")
+        print("\n=== 视觉操控 (Bridge Mode) ===")
+        print("  此脚本已集成数据桥接，可与录制器完美配合")
         print("\n=== 录制控制 ===")
         print("  [O] - 开始录制")
         print("  [P] - 保存录制")
         print("  [L] - 丢弃录制")
-        print("\n=== 数据发布话题 ===")
-        print("  - 夹爪当前状态: /gripper/state_feedback (100Hz)")
-        print("  - 夹爪目标状态: /gripper/command_update (100Hz)")
-        print("  - 录制控制:     /recorder/command")
+        print("\n=== 数据流 ===")
+        print("  1. 接收: /dobot_msgs_v3/msg/ToolVectorTarget (from feedback node)")
+        print("  2. 转发: /robot/target_pose (to recorder)")
+        print("  3. 夹爪: /gripper/command_update & feedback (100Hz)")
         print("")
 
         while self.running:
@@ -636,11 +540,8 @@ class AutoPickApp:
             if not ret: break
             
             preview = cv2.resize(frame, (1280, 960))
-            
             if self.click_state == 1 and self.pt1_uv is not None:
                 cv2.circle(preview, self.pt1_uv, 10, (0, 255, 255), 2)
-                cv2.putText(preview, "Click Direction", (self.pt1_uv[0]+15, self.pt1_uv[1]), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             status_text = "BUSY" if self.robot_busy else ("WAITING" if self.click_state == 1 else "READY")
             cv2.putText(preview, f"Status: {status_text}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
@@ -650,25 +551,20 @@ class AutoPickApp:
             if key in [ord('q'), 27]:
                 self.running = False
                 self.stop_robot()
-            elif key == ord('x'):
-                self.stop_robot()
-            # [新增] 录制控制键
+            elif key == ord('x'): self.stop_robot()
+            
+            # 录制控制
             elif key == ord('o'):
-                msg = Int32()
-                msg.data = 1
-                self.node.pub_record_cmd.publish(msg)
-                print("[录制] 开始录制")
+                self.node.pub_record_cmd.publish(Int32(data=1))
+                print("[录制] START")
             elif key == ord('p'):
-                msg = Int32()
-                msg.data = 2
-                self.node.pub_record_cmd.publish(msg)
-                print("[录制] 保存录制")
+                self.node.pub_record_cmd.publish(Int32(data=2))
+                print("[录制] SAVE")
             elif key == ord('l'):
-                msg = Int32()
-                msg.data = 0
-                self.node.pub_record_cmd.publish(msg)
-                print("[录制] 丢弃录制")
-            # 相机参数调节
+                self.node.pub_record_cmd.publish(Int32(data=0))
+                print("[录制] DISCARD")
+            
+            # 相机调节
             elif key in [ord('+'), ord('=')]: self.cam_driver.set_exposure(self.cam_driver.current_exp + 20)
             elif key == ord('-'): self.cam_driver.set_exposure(self.cam_driver.current_exp - 20)
             elif key in [ord('*'), ord('8')]: self.cam_driver.set_focus(self.cam_driver.current_focus + 10)
