@@ -469,7 +469,7 @@ python3 dobot_demo/dobot_demo/analyze_playback.py playback_eval/evaluation_0.hdf
 ```
 
 ---
-
+source /home/hit/dobot_ws_xing/install/setup.bash
 ## 快速参考：常用命令
 
 ### 系统启动
