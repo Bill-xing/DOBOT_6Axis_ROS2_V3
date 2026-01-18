@@ -219,128 +219,300 @@ class DobotRosWrapper(Node):
         res = self.call_service(self.cli_inverse, req)
         return True if (res is not None and res.res == 0) else False
 
-class GripperManager(threading.Thread):
+class GripperComm:
+    """
+    底层 Modbus 通信类，只负责发协议，不含控制逻辑
+    [新增] 后台异步读取线程，避免阻塞主循环
+    """
     def __init__(self, wrapper):
-        super().__init__(daemon=True)
         self.wrapper = wrapper
         self.id = 0
-        self.running = True
-        self.target_pos = 1000.0
         self.init_connection()
 
+        # [新增] 缓存的夹爪位置，由后台线程更新
+        self.cached_position = None
+        self.cached_position_lock = threading.Lock()
+
+        # [新增] 启动后台读取线程
+        self.reader_thread = threading.Thread(target=self._background_reader, daemon=True)
+        self.reader_running = True
+        self.reader_thread.start()
+
     def init_connection(self):
-        try:
-            for i in range(1, 5): 
-                req = ModbusClose.Request()
-                req.index = i
-                self.wrapper.call_service(self.wrapper.cli_modbus_close, req)
-            
-            req = ModbusCreate.Request()
-            req.ip = "127.0.0.1"; req.port = 60000; req.slave_id = 1; req.is_rtu = 1
-            res = self.wrapper.call_service(self.wrapper.cli_modbus_create, req)
-            if res and res.res == 0:
-                match = re.search(r'(\d+)', str(res.index))
-                self.id = int(match.group(1)) if match else int(res.index)
-                self.write_reg(256, 1, "1", wait=True)
-                self.write_reg(257, 1, "60", wait=True)
-                print(f"[Gripper] Connected ID: {self.id}")
-        except: pass
+        # 关闭旧连接
+        print("[DEBUG] 正在关闭旧的Modbus连接...")
+        for i in range(1, 5):
+            req = ModbusClose.Request()
+            req.index = i
+            self.wrapper.call_service(self.wrapper.cli_modbus_close, req)
+
+        # 创建连接
+        print("[DEBUG] 正在创建新的Modbus连接...")
+        req = ModbusCreate.Request()
+        req.ip = "127.0.0.1"
+        req.port = 60000
+        req.slave_id = 1
+        req.is_rtu = 1
+        res = self.wrapper.call_service(self.wrapper.cli_modbus_create, req)
+
+        print(f"[DEBUG] ModbusCreate 响应: res={res}, res.res={res.res if res else 'None'}, res.index={res.index if res else 'None'}")
+
+        if res and res.res == 0:
+            match = re.search(r'(\d+)', str(res.index))
+            self.id = int(match.group(1)) if match else int(res.index)
+            print(f"[SUCCESS] Gripper Connected, ID: {self.id}")
+        else:
+            print(f"[ERROR] Gripper ModbusCreate Failed! Response: {res}")
+            self.id = 0
+
+        if self.id > 0:
+            print("[DEBUG] 初始化夹爪寄存器...")
+            self.write_reg(256, 1, "1", wait=True) # Enable
+            print("[DEBUG] 寄存器256 (Enable) = 1")
+            self.write_reg(257, 1, "60", wait=True) # Force/Speed
+            print("[DEBUG] 寄存器257 (Force/Speed) = 60")
 
     def write_reg(self, addr, count, val_str, wait=False):
         if self.id <= 0: return
         req = SetHoldRegs.Request()
-        req.index = self.id; req.addr = addr; req.count = count; req.val_tab = val_str
-        if wait: self.wrapper.call_service(self.wrapper.cli_set_hold_regs, req)
-        else: self.wrapper.call_service_async_no_wait(self.wrapper.cli_set_hold_regs, req)
+        req.index = self.id
+        req.addr = addr
+        req.count = count
+        req.val_tab = val_str  # 保持字符串类型（ROS消息定义要求）
+        if wait:
+            self.wrapper.call_service(self.wrapper.cli_set_hold_regs, req)
+        else:
+            self.wrapper.call_service_async_no_wait(self.wrapper.cli_set_hold_regs, req)
+
+    def read_reg(self, addr):
+        """阻塞读取寄存器（仅用于初始化等场景）"""
+        if self.id <= 0: return None
+        req = GetHoldRegs.Request()
+        req.index = self.id
+        req.addr = addr
+        req.count = 1
+        res = self.wrapper.call_service(self.wrapper.cli_get_hold_regs, req)
+        if res and res.res == 0:
+            try:
+                return int(res.value)
+            except:
+                pass
+        return None
+
+    def _background_reader(self):
+        """后台线程：持续读取夹爪位置并更新缓存"""
+        print("[DEBUG] GripperComm 后台读取线程已启动")
+        while self.reader_running:
+            if self.id > 0:
+                try:
+                    # 阻塞读取（在后台线程中不影响主循环）
+                    pos = self.read_reg(514)
+                    if pos is not None:
+                        with self.cached_position_lock:
+                            self.cached_position = pos
+                except Exception as e:
+                    print(f"[ERROR] 后台读取夹爪位置失败: {e}")
+            time.sleep(0.05)  # 20Hz 读取频率，避免过于频繁
+
+    def get_cached_position(self):
+        """非阻塞获取缓存的夹爪位置"""
+        with self.cached_position_lock:
+            return self.cached_position
+
+    def stop_reader(self):
+        """停止后台读取线程"""
+        self.reader_running = False
+        if self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=1.0)
+
+class GripperManager(threading.Thread):
+    """
+    [新架构] 独立的夹爪控制进程（线程）
+    完全负责：状态维护、指令发送
+    """
+    def __init__(self, wrapper):
+        super().__init__(daemon=True)
+        self.wrapper = wrapper
+        self.comm = GripperComm(wrapper)
+        self.running = True
+        self.target_pos = 1000.0
 
     def set_target(self, pos):
         self.target_pos = float(pos)
 
     def run(self):
         while self.running:
-            self.write_reg(259, 1, str(int(self.target_pos)), wait=False)
+            self.comm.write_reg(259, 1, str(int(self.target_pos)), wait=False)
             time.sleep(0.02)
 
 class GripperStateFeedback(threading.Thread):
     """
-    独立的夹爪状态反馈线程 (完美配合录制器)
+    [新增] 独立的夹爪状态反馈线程
+    专门负责定期读取夹爪实际位置并发布当前状态和目标状态
     使用高频发布(100Hz)+低频采样(10Hz)+基于时间的线性插补
     """
-    def __init__(self, wrapper, gripper_manager):
+    def __init__(self, wrapper, comm, gripper_manager):
         super().__init__(daemon=True)
         self.wrapper = wrapper
+        self.comm = comm
         self.gripper_manager = gripper_manager
         self.running = True
-        self.feedback_rate = 100.0
-        self.modbus_read_rate = 10.0
-        self.read_interval = 1.0 / self.modbus_read_rate
+
+        # 频率设置
+        self.feedback_rate = 100.0  # 发布频率 100Hz（参考 joint_states.py）
+        self.modbus_read_rate = 10.0  # Modbus实际读取频率 10Hz
+        self.read_interval = 1.0 / self.modbus_read_rate  # 读取间隔 0.1秒
+
+        # 插补所需的状态变量（基于时间戳）
         self.last_read_time = time.time()
-        self.last_real_pos = None; self.current_real_pos = None
-        self.last_real_read_time = None; self.current_real_read_time = None
-        self.last_target_pos = None; self.current_target_pos = None
-        self.last_target_read_time = None; self.current_target_read_time = None
+
+        # 当前状态插补
+        self.last_real_pos = None
+        self.current_real_pos = None
+        self.last_real_read_time = None
+        self.current_real_read_time = None
+
+        # 目标状态插补
+        self.last_target_pos = None
+        self.current_target_pos = None
+        self.last_target_read_time = None
+        self.current_target_read_time = None
 
     def _interpolate(self, last_val, current_val, last_time, current_time, now):
-        if last_val is None or current_val is None: return current_val if current_val is not None else 0.0
-        if last_time is None or current_time is None: return current_val
+        """
+        基于时间的线性插补
+        """
+        if last_val is None or current_val is None:
+            return current_val if current_val is not None else 0.0
+
+        if last_time is None or current_time is None:
+            return current_val
+
+        # 计算插补系数
         time_span = current_time - last_time
-        if time_span <= 0: return current_val
+        if time_span <= 0:
+            return current_val
+
         elapsed = now - last_time
-        alpha = min(1.0, elapsed / time_span)
+        alpha = min(1.0, elapsed / time_span)  # 限制在 [0, 1]
+
+        # 线性插补
         return last_val + alpha * (current_val - last_val)
 
-    def read_gripper_position(self):
-        if self.gripper_manager.id <= 0: return None
-        try:
-            req = GetHoldRegs.Request()
-            req.index = self.gripper_manager.id; req.addr = 514; req.count = 1
-            res = self.wrapper.call_service(self.wrapper.cli_get_hold_regs, req)
-            if res and res.res == 0: return int(res.value)
-        except: pass
-        return None
-
     def run(self):
+        """
+        核心循环：以100Hz频率发布夹爪状态（当前+目标），使用基于时间的线性插补
+        """
+        loop_count = 0
+        start_time = time.time()
+
+        # 性能分析变量
+        time_get_clock = 0
+        time_read_modbus = 0
+        time_interpolate = 0
+        time_publish = 0
+
         while self.running:
             try:
                 now = time.time()
-                timestamp = self.wrapper.get_clock().now().to_msg()
 
+                t0 = time.time()
+                timestamp = self.wrapper.get_clock().now().to_msg()
+                time_get_clock += time.time() - t0
+
+                # === 每0.1秒读取一次真实值 ===
                 if now - self.last_read_time >= self.read_interval:
                     self.last_read_time = now
-                    real_pos = self.read_gripper_position()
+
+                    # [优化] 非阻塞读取缓存的夹爪位置（后台线程已在更新）
+                    t0 = time.time()
+                    real_pos = self.comm.get_cached_position()
+                    time_read_modbus += time.time() - t0
+
                     if real_pos is not None:
                         self.last_real_pos = self.current_real_pos
                         self.last_real_read_time = self.current_real_read_time
+
                         self.current_real_pos = float(real_pos)
                         self.current_real_read_time = now
 
+                    # 读取目标位置（直接使用控制指令）
                     target = self.gripper_manager.target_pos
+
                     self.last_target_pos = self.current_target_pos
                     self.last_target_read_time = self.current_target_read_time
+
                     self.current_target_pos = target
                     self.current_target_read_time = now
 
-                interpolated_current = self._interpolate(self.last_real_pos, self.current_real_pos,
-                                                         self.last_real_read_time, self.current_real_read_time, now)
-                interpolated_target = self._interpolate(self.last_target_pos, self.current_target_pos,
-                                                        self.last_target_read_time, self.current_target_read_time, now)
+                # === 基于时间的线性插补计算 ===
+                t0 = time.time()
+                interpolated_current = self._interpolate(
+                    self.last_real_pos,
+                    self.current_real_pos,
+                    self.last_real_read_time,
+                    self.current_real_read_time,
+                    now
+                )
 
+                interpolated_target = self._interpolate(
+                    self.last_target_pos,
+                    self.current_target_pos,
+                    self.last_target_read_time,
+                    self.current_target_read_time,
+                    now
+                )
+                time_interpolate += time.time() - t0
+
+                # === 发布插补后的状态（100Hz）===
+                t0 = time.time()
                 # 发布当前状态
                 msg_current = PointStamped()
                 msg_current.header.stamp = timestamp
                 msg_current.header.frame_id = "gripper_feedback"
                 msg_current.point.x = float(interpolated_current)
+                msg_current.point.y = 0.0
+                msg_current.point.z = 0.0
                 self.wrapper.pub_gripper_state.publish(msg_current)
 
-                # 发布目标状态 (Command)
+                # 发布目标状态
                 msg_target = PointStamped()
                 msg_target.header.stamp = timestamp
                 msg_target.header.frame_id = "gripper_command"
                 msg_target.point.x = float(interpolated_target)
+                msg_target.point.y = 0.0
+                msg_target.point.z = 0.0
                 self.wrapper.pub_gripper_update.publish(msg_target)
+                time_publish += time.time() - t0
 
-            except Exception as e: print(f"[ERROR] GripperFeedback: {e}")
+            except Exception as e:
+                # 避免异常导致线程崩溃
+                print(f"[ERROR] GripperStateFeedback: {e}")
+
+            # 控制循环频率 100Hz
             time.sleep(1.0 / self.feedback_rate)
+
+            # [调试] 每秒打印一次实际频率和性能分析
+            loop_count += 1
+            if loop_count % 100 == 0:
+                elapsed = time.time() - start_time
+                actual_hz = loop_count / elapsed
+                avg_clock = (time_get_clock / loop_count) * 1000
+                avg_modbus = (time_read_modbus / max(1, loop_count//10)) * 1000  # 只每10次读一次
+                avg_interp = (time_interpolate / loop_count) * 1000
+                avg_pub = (time_publish / loop_count) * 1000
+
+                print(f"[GripperFeedback] 频率: {actual_hz:.1f} Hz | "
+                      f"时钟: {avg_clock:.1f}ms | Modbus: {avg_modbus:.1f}ms | "
+                      f"插值: {avg_interp:.2f}ms | 发布: {avg_pub:.1f}ms")
+
+                if loop_count >= 1000:  # 重置计数器避免溢出
+                    loop_count = 0
+                    start_time = time.time()
+                    time_get_clock = 0
+                    time_read_modbus = 0
+                    time_interpolate = 0
+                    time_publish = 0
 
 # ================= 4. 主程序 (集成逆解验证与数据采集桥接) =================
 
@@ -363,7 +535,8 @@ class AutoPickApp:
         self.gripper = GripperManager(self.node)
         self.gripper.start()
 
-        self.gripper_feedback = GripperStateFeedback(self.node, self.gripper)
+        # [新增] 启动独立的夹爪状态反馈线程（传入 comm 参数）
+        self.gripper_feedback = GripperStateFeedback(self.node, self.gripper.comm, self.gripper)
         self.gripper_feedback.start()
 
         self.cam_driver = Camera8KDriver(device_index=0) 
@@ -572,6 +745,7 @@ class AutoPickApp:
 
         self.gripper.running = False
         self.gripper_feedback.running = False
+        self.gripper.comm.stop_reader()  # [新增] 停止后台 Modbus 读取线程
         self.cam_driver.release()
         self.node.destroy_node()
         rclpy.shutdown()
