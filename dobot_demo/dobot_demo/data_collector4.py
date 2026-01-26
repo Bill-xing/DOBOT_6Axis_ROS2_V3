@@ -217,10 +217,10 @@ class GripperManager(threading.Thread):
 
                 # 计算新位置 (开环控制)
                 if left_pressed: # 闭合
-                    self.current_pos = max(0.0, self.current_pos - self.GRIPPER_STEP * 0.5) # 稍微降速适配循环频率
+                    self.current_pos = max(0.0, self.current_pos - self.GRIPPER_STEP) # 稍微降速适配循环频率
                     changed = True
                 elif right_pressed: # 张开
-                    self.current_pos = min(1000.0, self.current_pos + self.GRIPPER_STEP * 0.5)
+                    self.current_pos = min(1000.0, self.current_pos + self.GRIPPER_STEP)
                     changed = True
                 
                 if changed:
@@ -498,9 +498,10 @@ class TeleopController:
         # 参数
         self.LOOP_RATE = 100.0
         self.MOUSE_SENSITIVITY = 0.1
-        self.SCROLL_SENSITIVITY = 2.0
-        self.KEY_XYZ_STEP = 0.3
-        self.KEY_XYZ_STEP_FAST = 0.6
+        # self.SCROLL_SENSITIVITY = 2.0
+        self.SCROLL_SENSITIVITY = 5.0
+        self.KEY_XYZ_STEP = 0.6
+        self.KEY_XYZ_STEP_FAST = 0.8
         self.KEY_ROT_STEP = 0.3
 
         # [新增] 垂直抓取 (Vertical Grab) 参数
@@ -513,6 +514,27 @@ class TeleopController:
         self.V_RG = 180.0         # 夹爪闭合速率 rg (单位/tick, 100Hz下 800单位/s)
 
         self.vgrab_state = 0    # 0=Idle, 1=Descending, 2=Ascending+Closing
+
+        # [新增] 录制起始/结束位置 (从图片中读取的参数)
+        self.RECORD_HOME_POSE = [
+            116.22736202727263,      # x
+            -562.0755453327145,     # y
+            278.6781595848309,      # z
+            -176.34093460159997,    # rx
+            -0.3747282984917232,    # ry
+            82.69540118216263       # rz
+        ]
+        self.RECORD_HOME_GRIPPER = 1000.0  # 夹爪初始位置（完全张开）
+        self.moving_to_home = False  # 是否正在移动到起始位置
+        self.home_move_callback = None  # 移动完成后的回调
+        self.home_settling = False  # 是否正在等待到位后稳定
+        self.home_settle_counter = 0  # 稳定等待计数器
+        self.HOME_SETTLE_TICKS = 5  # 到位后等待的tick数 (100Hz下约1秒)
+
+        # [新增] 复位平滑处理参数
+        self.home_start_pose = None  # 复位开始时的位置
+        self.home_total_distance = None  # 复位总距离（用于计算进度）
+        self.home_progress = 0.0  # 当前进度 [0, 1]
 
         self.running = True
         self.control_enabled = True  # 新增：控制启用/禁用标志
@@ -574,12 +596,120 @@ class TeleopController:
             if pose:
                 self.target_pose = pose
                 # 初始化垂直抓取的高度参数，防止硬编码导致撞击（可选，如果需要绝对值请注释掉）
-                # self.V_Z2 = self.target_pose[2] 
-                # self.V_Z1 = max(0.0, self.target_pose[2] - 50.0) 
+                # self.V_Z2 = self.target_pose[2]
+                # self.V_Z1 = max(0.0, self.target_pose[2] - 50.0)
                 return
             time.sleep(0.5)
         print("错误：无法获取机械臂初始位置！")
         sys.exit(1)
+
+    def move_to_home_pose(self, callback=None):
+        """
+        开始移动到录制起始位置
+        callback: 移动完成后执行的回调函数
+        """
+        self.moving_to_home = True
+        self.home_move_callback = callback
+        self.home_settling = False
+        self.home_settle_counter = 0
+
+        # [新增] 记录起始位置，用于平滑插值
+        self.home_start_pose = self.target_pose.copy()
+        self.home_progress = 0.0
+
+        # 计算各轴的总距离（用于进度计算）
+        # 使用加权距离：位置轴权重1，旋转轴权重较小
+        pos_weight = 1.0
+        rot_weight = 0.1  # 旋转轴权重较小
+        weights = [pos_weight, pos_weight, pos_weight, rot_weight, rot_weight, rot_weight]
+
+        total_dist_sq = 0.0
+        for i in range(6):
+            diff = self.RECORD_HOME_POSE[i] - self.home_start_pose[i]
+            total_dist_sq += (diff * weights[i]) ** 2
+        self.home_total_distance = math.sqrt(total_dist_sq)
+
+        # 启用夹爪自动模式，移动到初始位置
+        self.gripper_worker.set_auto_mode(True, self.RECORD_HOME_GRIPPER)
+        print(">>> 正在移动到录制起始位置...")
+
+    def _check_home_reached(self):
+        """检查是否到达起始位置（允许一定误差）"""
+        threshold = 2.0  # 位置误差阈值 (mm/度)
+        for i in range(6):
+            if abs(self.target_pose[i] - self.RECORD_HOME_POSE[i]) > threshold:
+                return False
+        return True
+
+    def _smoothstep(self, t):
+        """
+        S曲线缓动函数 (smoothstep)
+        输入 t 在 [0, 1] 范围内，输出也在 [0, 1] 范围内
+        实现平滑的加速和减速
+        """
+        # 使用 smootherstep (Ken Perlin 改进版)，更平滑
+        t = max(0.0, min(1.0, t))  # 限制在 [0, 1]
+        return t * t * t * (t * (t * 6 - 15) + 10)
+
+    def _update_move_to_home(self):
+        """
+        平滑移动到起始位置（在主循环中调用）
+        使用S曲线实现平滑的加速和减速
+        返回: True 如果仍在移动, False 如果已到达
+        """
+        if not self.moving_to_home:
+            return False
+
+        # 移动速度参数
+        PROGRESS_SPEED = 0.25  # 每tick进度增量，控制整体移动速度
+        GRIPPER_THRESHOLD = 50.0  # 夹爪位置误差阈值
+
+        # 更新进度
+        self.home_progress += PROGRESS_SPEED
+        self.home_progress = min(1.0, self.home_progress)
+
+        # 使用S曲线计算平滑后的进度
+        smooth_progress = self._smoothstep(self.home_progress)
+
+        # 根据平滑进度插值计算目标位置
+        for i in range(6):
+            start = self.home_start_pose[i]
+            end = self.RECORD_HOME_POSE[i]
+            self.target_pose[i] = start + (end - start) * smooth_progress
+
+        # 检查是否到达目标
+        all_reached = self.home_progress >= 1.0
+
+        # 检查夹爪是否到位
+        gripper_diff = abs(self.gripper_worker.current_pos - self.RECORD_HOME_GRIPPER)
+        if gripper_diff > GRIPPER_THRESHOLD:
+            all_reached = False
+
+        if all_reached:
+            if not self.home_settling:
+                # 刚到达目标位置，进入稳定等待阶段
+                self.home_settling = True
+                self.home_settle_counter = 0
+                print(">>> 已到达录制起始位置，等待稳定...")
+                return True
+
+            self.home_settle_counter += 1
+            if self.home_settle_counter < self.HOME_SETTLE_TICKS:
+                # 仍在稳定等待中，继续发送保持指令
+                return True
+
+            # 稳定等待完成
+            self.moving_to_home = False
+            self.home_settling = False
+            # 关闭夹爪自动模式，交还手动控制
+            self.gripper_worker.set_auto_mode(False)
+            print(">>> 稳定完成，执行录制指令")
+            if self.home_move_callback:
+                self.home_move_callback()
+                self.home_move_callback = None
+            return False
+
+        return True
 
     # --- 输入回调 (运行在 pynput 线程) ---
     def _on_mouse_move(self, x, y):
@@ -628,8 +758,22 @@ class TeleopController:
 
                 # 录制指令
                 msg = Int32()
-                if char_key == 'o': msg.data = 1; self.robot.node.pub_record_cmd.publish(msg); print("Rec Start")
-                elif char_key == 'p': msg.data = 2; self.robot.node.pub_record_cmd.publish(msg); print("Rec Save")
+                if char_key == 'o':
+                    # 录制开始：先移动到起始位置，然后发送开始指令
+                    def start_recording():
+                        msg = Int32()
+                        msg.data = 1
+                        self.robot.node.pub_record_cmd.publish(msg)
+                        print("Rec Start")
+                    self.move_to_home_pose(callback=start_recording)
+                elif char_key == 'p':
+                    # 录制结束：先移动到起始位置，然后发送保存指令
+                    def save_recording():
+                        msg = Int32()
+                        msg.data = 2
+                        self.robot.node.pub_record_cmd.publish(msg)
+                        print("Rec Save")
+                    self.move_to_home_pose(callback=save_recording)
                 elif char_key == 'l': msg.data = 0; self.robot.node.pub_record_cmd.publish(msg); print("Rec Discard")
 
                 # [新增] Z键触发垂直抓取
@@ -667,6 +811,23 @@ class TeleopController:
                 self.robot.publish_target_pose(*self.target_pose)
 
                 time.sleep(1.0 / self.LOOP_RATE)
+                continue
+
+            # [新增] 移动到录制起始位置的处理
+            if self.moving_to_home:
+                # 忽略鼠标输入
+                self.mouse_state.get_and_clear_move()
+                self.mouse_state.get_and_clear_scroll()
+                # 更新移动
+                self._update_move_to_home()
+                # 发送机械臂指令
+                self.robot.ServoP(*self.target_pose)
+                self.robot.publish_target_pose(*self.target_pose)
+                # 循环频率控制
+                elapsed = time.time() - start_time
+                sleep_time = (1.0 / self.LOOP_RATE) - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
                 continue
 
             # [新增] 垂直抓取状态机

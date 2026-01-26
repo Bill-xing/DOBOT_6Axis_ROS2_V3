@@ -26,7 +26,14 @@ LeRobot v2.0 标准目录结构:
         └── tasks.jsonl        # 任务描述
 
 使用方法:
+    # 单个数据集
     python convert_to_lerobot.py --input ./data --output ./lerobot_dataset --repo-id "dobot/teleop"
+
+    # 合并多个数据集（方法1：多次指定--input）
+    python convert_to_lerobot.py --input ./data1 --input ./data2 --output ./lerobot_dataset --repo-id "dobot/teleop"
+
+    # 合并多个数据集（方法2：使用逗号分隔列表）
+    python convert_to_lerobot.py --input-list './data1,./data2,./data3' --output ./lerobot_dataset --repo-id "dobot/teleop"
 
 依赖安装:
     pip install h5py numpy tqdm pyarrow opencv-python pillow
@@ -61,20 +68,25 @@ class HDF5ToLeRobotConverter:
     - 标准目录结构: data/chunk-000/, videos/chunk-000/, meta/
     """
 
-    def __init__(self, input_dir, output_dir, repo_id="dobot/teleop_dataset",
+    def __init__(self, input_dirs, output_dir, repo_id="dobot/teleop_dataset",
                  fps=30, video_codec='libx264', robot_type='dobot_cr3'):
         """
         初始化转换器
 
         参数:
-            input_dir (str): HDF5文件所在目录
+            input_dirs (list or str): HDF5文件所在目录，可以是单个路径或路径列表
             output_dir (str): LeRobot数据集输出目录
             repo_id (str): Hugging Face数据集ID
             fps (int): 视频帧率
             video_codec (str): 视频编码器 (libx264, h264, etc.)
             robot_type (str): 机器人类型
         """
-        self.input_dir = Path(input_dir)
+        # 支持单个路径或路径列表
+        if isinstance(input_dirs, (str, Path)):
+            self.input_dirs = [Path(input_dirs)]
+        else:
+            self.input_dirs = [Path(d) for d in input_dirs]
+
         self.output_dir = Path(output_dir)
         self.repo_id = repo_id
         self.fps = fps
@@ -102,14 +114,41 @@ class HDF5ToLeRobotConverter:
         self.global_index = 0
 
     def scan_episodes(self):
-        """扫描所有 episode_*.hdf5 文件"""
-        episode_files = sorted(self.input_dir.glob("episode_*.hdf5"))
-        print(f"Found {len(episode_files)} episodes in {self.input_dir}")
-        return episode_files
+        """
+        扫描所有输入目录中的 episode_*.hdf5 文件，并按顺序重新编号
 
-    def load_hdf5_episode(self, hdf5_path):
+        返回:
+            list: (hdf5_path, new_episode_index) 元组列表
+        """
+        all_episodes = []
+        new_episode_idx = 0
+
+        for input_dir in self.input_dirs:
+            if not input_dir.exists():
+                print(f"Warning: Input directory {input_dir} does not exist, skipping...")
+                continue
+
+            episode_files = list(input_dir.glob("episode_*.hdf5"))
+            # 按数字顺序排序（避免 episode_10 排在 episode_2 前面）
+            episode_files.sort(key=lambda p: int(p.stem.split('_')[1]))
+
+            print(f"Found {len(episode_files)} episodes in {input_dir}")
+
+            # 为每个文件分配新的连续索引
+            for hdf5_path in episode_files:
+                all_episodes.append((hdf5_path, new_episode_idx))
+                new_episode_idx += 1
+
+        print(f"\nTotal episodes to convert: {len(all_episodes)}")
+        return all_episodes
+
+    def load_hdf5_episode(self, hdf5_path, new_episode_idx=None):
         """
         加载单个HDF5 episode
+
+        参数:
+            hdf5_path (Path): HDF5文件路径
+            new_episode_idx (int): 新的episode索引（用于合并多个数据集时重新编号）
 
         返回:
             dict: episode数据
@@ -179,9 +218,12 @@ class HDF5ToLeRobotConverter:
             if self.camera_intrinsics is None and 'camera/intrinsics' in f:
                 self.camera_intrinsics = f['camera/intrinsics'][:]
 
-        # 提取episode索引
-        filename = hdf5_path.stem  # episode_0
-        data['episode_index'] = int(filename.split('_')[1])
+        # 提取episode索引（使用新索引或从文件名提取）
+        if new_episode_idx is not None:
+            data['episode_index'] = new_episode_idx
+        else:
+            filename = hdf5_path.stem  # episode_0
+            data['episode_index'] = int(filename.split('_')[1])
 
         return data
 
@@ -278,6 +320,9 @@ class HDF5ToLeRobotConverter:
         }
 
         table = pa.Table.from_pydict(table_data)
+
+        # 确保数据按 frame_index 排序（LeRobot 要求时间戳单调递增）
+        table = table.sort_by('frame_index')
 
         # 8. 保存为Parquet文件
         parquet_filename = f"episode_{ep_idx:06d}.parquet"
@@ -589,22 +634,24 @@ Generated with HDF5 to LeRobot v2.0 converter (any4lerobot compatible)
         """执行完整的转换流程"""
         print(f"=== HDF5 to LeRobot v2.0 Converter ===")
         print(f"Based on any4lerobot format specification")
-        print(f"Input:  {self.input_dir}")
+        print(f"Input directories:")
+        for input_dir in self.input_dirs:
+            print(f"  - {input_dir}")
         print(f"Output: {self.output_dir}")
         print(f"Repo:   {self.repo_id}")
         print()
 
-        # 1. 扫描episode文件
-        episode_files = self.scan_episodes()
-        if len(episode_files) == 0:
+        # 1. 扫描所有输入目录中的episode文件
+        episode_list = self.scan_episodes()
+        if len(episode_list) == 0:
             print("Error: No episode files found!")
             return
 
-        # 2. 加载所有episodes
+        # 2. 加载所有episodes（使用新的episode索引）
         print("\nLoading episodes...")
         all_episodes_data = []
-        for hdf5_path in tqdm(episode_files, desc="Loading HDF5"):
-            episode_data = self.load_hdf5_episode(hdf5_path)
+        for hdf5_path, new_ep_idx in tqdm(episode_list, desc="Loading HDF5"):
+            episode_data = self.load_hdf5_episode(hdf5_path, new_ep_idx)
             all_episodes_data.append(episode_data)
 
         # 3. 计算统计信息
@@ -647,21 +694,31 @@ Generated with HDF5 to LeRobot v2.0 converter (any4lerobot compatible)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert HDF5 robot dataset to LeRobot v2.0 format (any4lerobot compatible)"
+        description="Convert HDF5 robot dataset to LeRobot v2.0 format (any4lerobot compatible). "
+                    "Supports merging multiple input datasets."
     )
 
     parser.add_argument(
         "--input", "-i",
         type=str,
-        default="./data",
-        help="Input directory containing episode_*.hdf5 files (default: ./data)"
+        action='append',
+        help="Input directory containing episode_*.hdf5 files. "
+             "Can be specified multiple times to merge multiple datasets. "
+             "Example: --input ./data1 --input ./data2"
+    )
+
+    parser.add_argument(
+        "--input-list",
+        type=str,
+        help="Comma-separated list of input directories. "
+             "Example: --input-list './data1,./data2,./data3'"
     )
 
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="./lerobot_dataset",
-        help="Output directory for LeRobot dataset (default: ./lerobot_dataset)"
+        default="/home/hit/dobot_ws_xing/src/DOBOT_6Axis_ROS2_V3/dobot_demo/dobot_demo/convert/lerobot_dataset/dobot/teleop_dataset",
+        help="Output directory for LeRobot dataset"
     )
 
     parser.add_argument(
@@ -694,9 +751,25 @@ def main():
 
     args = parser.parse_args()
 
+    # 处理输入目录参数
+    input_dirs = []
+
+    # 从 --input 参数收集目录（可以指定多次）
+    if args.input:
+        input_dirs.extend(args.input)
+
+    # 从 --input-list 参数收集目录（逗号分隔）
+    if args.input_list:
+        input_dirs.extend([d.strip() for d in args.input_list.split(',')])
+
+    # 如果没有指定任何输入，使用默认值
+    if not input_dirs:
+        input_dirs = ['./data']
+        print("No input directories specified, using default: ./data")
+
     # 创建转换器并执行
     converter = HDF5ToLeRobotConverter(
-        input_dir=args.input,
+        input_dirs=input_dirs,
         output_dir=args.output,
         repo_id=args.repo_id,
         fps=args.fps,

@@ -23,6 +23,7 @@ import threading
 from collections import deque
 import time
 import bisect
+from datetime import datetime
 
 # ROS Messages
 from sensor_msgs.msg import Image, CameraInfo
@@ -57,9 +58,14 @@ class OptimizedDataRecorder(Node):
         super().__init__('optimized_data_recorder')
 
         # ========== 配置部分 ==========
-        self.data_dir = "./data"  # 数据保存目录
-        if not os.path.exists(self.data_dir):
-            os.makedirs(self.data_dir)
+        self.base_data_dir = "./data"  # 数据保存根目录
+        if not os.path.exists(self.base_data_dir):
+            os.makedirs(self.base_data_dir)
+
+        # 程序启动时创建以当前日期时刻命名的会话目录
+        timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.current_session_dir = os.path.join(self.base_data_dir, timestamp_str)
+        os.makedirs(self.current_session_dir, exist_ok=True)
 
         self.enable_depth = enable_depth  # 是否录制深度图（False=禁用，True=启用，但性能下降）
         self.bridge = CvBridge()  # ROS Image消息与OpenCV Mat的转换工具
@@ -143,6 +149,7 @@ class OptimizedDataRecorder(Node):
         self.create_timer(2.0, self.debug_callback)
 
         self.get_logger().info("=== Optimized Data Recorder Initialized ===")
+        self.get_logger().info(f"Session directory: {self.current_session_dir}")
         self.get_logger().info(f"Depth recording: {'ENABLED' if enable_depth else 'DISABLED'}")
         self.get_logger().info("Async processing with efficient interpolation")
         self.get_logger().info("Press 'O' to start recording.")
@@ -187,7 +194,13 @@ class OptimizedDataRecorder(Node):
         new_state = msg.data
         if new_state == 1 and self.recording_state != 1:
             self.get_logger().info(">>> START RECORDING")
+            # 清空所有缓冲区
             self.episode_buffer = []
+            with self.queue_lock:
+                self.pending_queue.clear()
+            for key in self.msg_buffer:
+                if self.msg_buffer[key] is not None:
+                    self.msg_buffer[key].clear()
             self.recording_state = 1
 
         elif new_state == 2 and self.recording_state == 1:
@@ -696,21 +709,21 @@ class OptimizedDataRecorder(Node):
     def get_next_episode_index(self):
         """
         获取下一个可用的episode编号
-        
-        扫描data_dir目录，查找所有episode_*.hdf5文件
+
+        扫描当前会话目录，查找所有episode_*.hdf5文件
         提取文件名中的数字编号，返回最大编号+1
-        
+
         命名规则：episode_{index}.hdf5
         示例：episode_0.hdf5, episode_1.hdf5, episode_2.hdf5
-        
+
         返回：
             int: 下一个可用的episode编号（0开始）
-            
+
         示例：
             如果存在 episode_0.hdf5, episode_1.hdf5
             返回 2
         """
-        existing_files = [f for f in os.listdir(self.data_dir) if f.startswith('episode_') and f.endswith('.hdf5')]
+        existing_files = [f for f in os.listdir(self.current_session_dir) if f.startswith('episode_') and f.endswith('.hdf5')]
         if not existing_files:
             return 0
 
@@ -771,7 +784,7 @@ class OptimizedDataRecorder(Node):
             return
 
         idx = self.get_next_episode_index()
-        file_path = os.path.join(self.data_dir, f"episode_{idx}.hdf5")
+        file_path = os.path.join(self.current_session_dir, f"episode_{idx}.hdf5")
 
         self.get_logger().info(f"Saving {len(self.episode_buffer)} frames to {file_path}...")
 
