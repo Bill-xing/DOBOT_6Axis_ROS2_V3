@@ -64,7 +64,7 @@ pip install h5py numpy tqdm pyarrow opencv-python pillow
 ### 基本用法
 
 ```bash
-cd /home/xing/dobot_ws/src/DOBOT_6Axis_ROS2_V3/dobot_demo/dobot_demo/convert
+cd /home/hit/dobot_ws_xing/src/DOBOT_6Axis_ROS2_V3/dobot_demo/dobot_demo/convert
 
 # 转换数据集
 python convert_to_lerobot.py --input ../data --output ./lerobot_dataset
