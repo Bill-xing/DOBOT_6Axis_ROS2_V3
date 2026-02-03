@@ -417,8 +417,17 @@ class DobotApiMove(DobotApi):
     def ServoP(self, x, y, z, rx,ry,rz):
         string = "ServoP({:f},{:f},{:f},{:f},{:f},{:f})".format(
             x, y, z, rx,ry,rz)
-        print(string) 
+        print(string)
         return self.sendRecvMsg(string)
+
+    def ServoPNoWait(self, x, y, z, rx, ry, rz):
+        """
+        异步ServoP：只发送命令，不等待控制器响应
+        用于高频控制（30Hz），牺牲错误检测换取速度
+        """
+        string = "ServoP({:f},{:f},{:f},{:f},{:f},{:f})".format(
+            x, y, z, rx, ry, rz)
+        self.send_data(string)  # 只发送，不调用 wait_reply()
 
     def Jump(self):
         print("待定")

@@ -87,6 +87,7 @@ set(srv_files
       "srv/RunScript.srv"
       "srv/ServoJ.srv"
       "srv/ServoP.srv"
+      "srv/ServoPNoWait.srv"
       "srv/SetArmOrientation.srv"
       "srv/SetCoils.srv"
       "srv/SetCollisionLevel.srv"

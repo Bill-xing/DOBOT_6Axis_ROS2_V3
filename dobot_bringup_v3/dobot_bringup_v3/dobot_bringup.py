@@ -73,6 +73,7 @@ class adderServer(Node):
         self.srv = self.create_service(MovL,'/dobot_bringup_v3/srv/MovL',self.MovL)
         self.srv = self.create_service(ServoJ,'/dobot_bringup_v3/srv/ServoJ',self.ServoJ)
         self.srv = self.create_service(ServoP,'/dobot_bringup_v3/srv/ServoP',self.ServoP)
+        self.srv = self.create_service(ServoPNoWait,'/dobot_bringup_v3/srv/ServoPNoWait',self.ServoPNoWait)
         self.srv = self.create_service(MovLIO,'/dobot_bringup_v3/srv/MovLIO',self.MovLIO)
         self.srv = self.create_service(MoveJog,'/dobot_bringup_v3/srv/MoveJog',self.MoveJog)
         # self.srv = self.create_service(RelJointMovJ,'/dobot_bringup_v3/srv/RelJointMovJ',self.RelJointMovJ)
@@ -356,13 +357,34 @@ class adderServer(Node):
         self.get_logger().info(return_t)                                     
         return response 
     
-    def ServoP(self, request, response):                                
+    def ServoP(self, request, response):
         return_t = self.move.ServoP(request.x,request.y,request.z,request.rx,request.ry,request.rz)
-        return_tt = return_t[:return_t.find("{")-1]
-        response.res = int(return_tt)                                           
-        self.get_logger().info(return_t)                                     
-        return response 
-    
+        try:
+            # 尝试解析返回值
+            if "{" in return_t:
+                return_tt = return_t[:return_t.find("{")-1]
+            else:
+                # 如果没有 {，尝试提取第一个数字
+                import re
+                match = re.search(r'^(-?\d+)', return_t)
+                return_tt = match.group(1) if match else "0"
+            response.res = int(return_tt)
+        except (ValueError, AttributeError) as e:
+            self.get_logger().warning(f"Failed to parse ServoP response: {return_t}, error: {e}")
+            response.res = 0  # 默认返回 0
+        self.get_logger().info(return_t)
+        return response
+
+    def ServoPNoWait(self, request, response):
+        """ServoPNoWait 服务处理器 - 高频控制专用"""
+        self.move.ServoPNoWait(
+            request.x, request.y, request.z,
+            request.rx, request.ry, request.rz
+        )
+        response.res = 0  # 无响应数据，返回0表示已发送
+        # 不打印日志，避免影响性能
+        return response
+
     def ServoJ(self, request, response):                                
         return_t = self.move.ServoJ(request.j1,request.j2,request.j3,request.j4,request.j5,request.j6,request.t,request.param_value)
         return_tt = return_t[:return_t.find("{")-1]
