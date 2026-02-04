@@ -229,8 +229,8 @@ class GripperManager(threading.Thread):
                     # 注释掉：现在由 GripperStateFeedback 线程统一发布
                     # self.publish_state(self.current_pos)
                 
-                # 保持一定的指令频率，约 10Hz (原逻辑) - 这里改为0.05
-                time.sleep(0.05)
+                # 保持一定的指令频率，约 30hz
+                time.sleep(0.033)
 
             else:
                 read_cnt = 0

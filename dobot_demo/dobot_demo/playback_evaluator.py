@@ -121,11 +121,20 @@ class PlaybackEvaluator(Node):
         # 自动录制控制
         self.auto_start_triggered = False
 
+        # 位置收敛检测参数
+        self.convergence_window_size = 10  # 收敛检测窗口大小（帧数）
+        self.convergence_pos_threshold = 2.0  # 位置收敛阈值（mm）
+        self.convergence_rot_threshold = 1.0  # 旋转收敛阈值（度）
+        self.recent_errors = []  # 最近的误差历史 [(pos_error, rot_error), ...]
+        self.convergence_check_interval = 0.1  # 收敛检查间隔（秒）
+        self.last_convergence_check = None
+
         self.get_logger().info("=" * 70)
         self.get_logger().info("播放评估录制器已启动")
         self.get_logger().info("=" * 70)
         self.get_logger().info("等待播放器发布话题...")
         self.get_logger().info("提示：启动 dataset_player.py 开始播放，本节点将自动开始录制")
+        self.get_logger().info(f"注意：将基于位置收敛检测自动开始录制（位置<{self.convergence_pos_threshold}mm，旋转<{self.convergence_rot_threshold}°）")
         self.get_logger().info("=" * 70)
 
     def get_timestamp(self, msg):
@@ -140,17 +149,26 @@ class PlaybackEvaluator(Node):
         timestamp = self.get_timestamp(msg)
         self.msg_buffer['robot_target'].append((timestamp, msg))
 
-        # 自动开始录制
+        # 检测播放开始
         if not self.is_recording and not self.auto_start_triggered:
-            self.get_logger().info("检测到播放开始，自动启动录制...")
-            self.start_recording()
+            self.get_logger().info("检测到播放开始，进入收敛检测模式...")
+            self.get_logger().info("等待机械臂到达初始位置并稳定...")
             self.auto_start_triggered = True
+            self.last_convergence_check = time.time()
 
     def robot_actual_callback(self, msg):
         """机械臂实际状态回调"""
         self.msg_count['robot_actual'] += 1
         timestamp = self.get_timestamp(msg)
         self.msg_buffer['robot_actual'].append((timestamp, msg))
+
+        # 收敛检测：检查是否应该开始录制
+        if not self.is_recording and self.auto_start_triggered:
+            current_time = time.time()
+            # 每隔一定时间进行一次收敛检查
+            if self.last_convergence_check is None or (current_time - self.last_convergence_check) >= self.convergence_check_interval:
+                self.last_convergence_check = current_time
+                self.check_convergence_and_start_recording()
 
         # 如果正在录制，处理数据
         if self.is_recording:
@@ -169,6 +187,78 @@ class PlaybackEvaluator(Node):
         self.msg_buffer['gripper_actual'].append((timestamp, msg))
 
     # ========== 数据处理 ==========
+
+    def check_convergence_and_start_recording(self):
+        """
+        检查机械臂是否已收敛到初始位置
+
+        通过监测最近N帧的目标-实际误差，判断机械臂是否已稳定。
+        如果连续N帧误差都小于阈值，认为已收敛，开始正式录制。
+        """
+        try:
+            # 查找最近的目标和实际消息
+            robot_target_match = self.find_closest_msg(
+                self.msg_buffer['robot_target'], time.time(), tolerance=0.1
+            )
+            robot_actual_match = self.find_closest_msg(
+                self.msg_buffer['robot_actual'], time.time(), tolerance=0.1
+            )
+
+            if not robot_target_match or not robot_actual_match:
+                return  # 数据不完整，等待下次检查
+
+            _, robot_target_msg = robot_target_match
+            _, robot_actual_msg = robot_actual_match
+
+            # 计算位置误差（笛卡尔空间）
+            pos_target = np.array([robot_target_msg.x, robot_target_msg.y, robot_target_msg.z])
+            pos_actual = np.array([robot_actual_msg.x, robot_actual_msg.y, robot_actual_msg.z])
+            pos_error = np.linalg.norm(pos_target - pos_actual)
+
+            # 计算旋转误差（欧拉角）
+            rot_target = np.array([robot_target_msg.rx, robot_target_msg.ry, robot_target_msg.rz])
+            rot_actual = np.array([robot_actual_msg.rx, robot_actual_msg.ry, robot_actual_msg.rz])
+            rot_error = np.linalg.norm(rot_target - rot_actual)
+
+            # 添加到误差历史
+            self.recent_errors.append((pos_error, rot_error))
+
+            # 保持固定窗口大小
+            if len(self.recent_errors) > self.convergence_window_size:
+                self.recent_errors.pop(0)
+
+            # 检查是否已收敛：窗口内所有误差都小于阈值
+            if len(self.recent_errors) >= self.convergence_window_size:
+                pos_errors = [e[0] for e in self.recent_errors]
+                rot_errors = [e[1] for e in self.recent_errors]
+
+                max_pos_error = max(pos_errors)
+                max_rot_error = max(rot_errors)
+                avg_pos_error = np.mean(pos_errors)
+                avg_rot_error = np.mean(rot_errors)
+
+                # 判断收敛：最大值和平均值都要小于阈值
+                if (max_pos_error < self.convergence_pos_threshold and
+                    max_rot_error < self.convergence_rot_threshold):
+
+                    self.get_logger().info("=" * 70)
+                    self.get_logger().info("✓ 检测到机械臂已收敛到初始位置！")
+                    self.get_logger().info(f"  位置误差: 平均={avg_pos_error:.2f}mm, 最大={max_pos_error:.2f}mm (阈值<{self.convergence_pos_threshold}mm)")
+                    self.get_logger().info(f"  旋转误差: 平均={avg_rot_error:.2f}°, 最大={max_rot_error:.2f}° (阈值<{self.convergence_rot_threshold}°)")
+                    self.get_logger().info("开始正式录制评估数据！")
+                    self.get_logger().info("=" * 70)
+
+                    self.start_recording()
+                else:
+                    # 定期输出当前误差状态（每10次检查输出一次）
+                    if len(self.recent_errors) % 10 == 0:
+                        self.get_logger().info(
+                            f"[收敛检测] 位置误差: {avg_pos_error:.2f}mm (最大{max_pos_error:.2f}mm), "
+                            f"旋转误差: {avg_rot_error:.2f}° (最大{max_rot_error:.2f}°)"
+                        )
+
+        except Exception as e:
+            self.get_logger().error(f"收敛检测出错: {e}")
 
     def find_closest_msg(self, buffer, target_time, tolerance=0.05):
         """
@@ -294,6 +384,18 @@ class PlaybackEvaluator(Node):
             f"gripper_target={self.msg_count['gripper_target']}, "
             f"gripper_actual={self.msg_count['gripper_actual']}"
         )
+
+        # 显示收敛检测状态
+        if self.auto_start_triggered and not self.is_recording:
+            if len(self.recent_errors) > 0:
+                pos_errors = [e[0] for e in self.recent_errors]
+                rot_errors = [e[1] for e in self.recent_errors]
+                self.get_logger().info(
+                    f"[收敛检测中] 已收集 {len(self.recent_errors)}/{self.convergence_window_size} 帧, "
+                    f"当前误差: 位置={np.mean(pos_errors):.2f}mm, 旋转={np.mean(rot_errors):.2f}°"
+                )
+            else:
+                self.get_logger().info("[收敛检测中] 等待数据...")
 
         if self.is_recording:
             self.get_logger().info(f"[录制中] 已录制帧数: {len(self.episode_buffer)}")

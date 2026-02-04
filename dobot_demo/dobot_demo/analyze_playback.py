@@ -35,6 +35,43 @@ import argparse  # 命令行参数解析库，解析脚本输入参数
 import sys  # 系统相关功能库，用于程序退出和输出
 import os  # 操作系统接口库，用于文件路径和目录操作
 
+def normalize_angle(angle):
+    """
+    将角度归一化到 [-180, 180] 度范围
+
+    处理角度周期性问题：0° 和 360° 是同一个角度
+    例如：365° -> 5°, -190° -> 170°
+
+    Args:
+        angle: 输入角度（度数）
+
+    Returns:
+        归一化后的角度，范围 [-180, 180]
+    """
+    # 先转换到 [0, 360) 范围
+    angle = angle % 360
+    # 再转换到 [-180, 180] 范围
+    if angle > 180:
+        angle -= 360
+    return angle
+
+def angular_difference(angle1, angle2):
+    """
+    计算两个角度之间的最小差值
+
+    考虑角度的周期性，返回最短的角度距离
+    例如：5° 和 355° 的差值是 10°，而不是 350°
+
+    Args:
+        angle1: 第一个角度（度数）
+        angle2: 第二个角度（度数）
+
+    Returns:
+        最小角度差值，范围 [0, 180]
+    """
+    diff = normalize_angle(angle1 - angle2)
+    return abs(diff)
+
 class PlaybackAnalyzer:
     """
     播放质量分析器
@@ -194,12 +231,19 @@ class PlaybackAnalyzer:
         # 提取机械臂目标姿态（后3列）：[rx_target, ry_target, rz_target]
         # 使用欧拉角表示（通常单位为度数）
         rot_target = self.data['robot_target'][:, 3:]
-        
+
         # 提取机械臂实际姿态（后3列）：[rx_actual, ry_actual, rz_actual]
         rot_actual = self.data['robot_actual'][:, 3:]
-        
-        # 计算欧拉角姿态误差：使用欧氏距离衡量两个旋转角度的差异
-        rot_errors = np.linalg.norm(rot_target - rot_actual, axis=1)
+
+        # 计算欧拉角姿态误差：考虑角度周期性
+        # 对每个欧拉角分量（rx, ry, rz）分别计算最小角度差
+        # 然后计算三个分量的欧氏距离
+        rot_diff_rx = np.array([angular_difference(t, a) for t, a in zip(rot_target[:, 0], rot_actual[:, 0])])
+        rot_diff_ry = np.array([angular_difference(t, a) for t, a in zip(rot_target[:, 1], rot_actual[:, 1])])
+        rot_diff_rz = np.array([angular_difference(t, a) for t, a in zip(rot_target[:, 2], rot_actual[:, 2])])
+
+        # 组合三个分量，计算总旋转误差（欧氏距离）
+        rot_errors = np.sqrt(rot_diff_rx**2 + rot_diff_ry**2 + rot_diff_rz**2)
 
         # 夹爪误差计算：
         # 将二维数组展平为一维（通常夹爪状态只有一个值，但防止维度不一致）

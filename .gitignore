@@ -46,3 +46,4 @@ dobot_demo/dobot_demo/convert/lerobot_dataset/*
 dobot_demo/dobot_demo/convert/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000000.mp4
 dobot_demo/dobot_demo/convert/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000001.mp4
 dobot_demo/dobot_demo/convert/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000002.mp4
+评估.md
