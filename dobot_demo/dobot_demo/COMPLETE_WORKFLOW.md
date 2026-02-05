@@ -112,7 +112,7 @@ cd /home/hit/dobot_ws_xing/src/DOBOT_6Axis_ROS2_V3
 python3 dobot_demo/dobot_demo/data_collector4.py
 ```
 
-输出：
+输出：        
 ```
 === 系统就绪 ===
  [Main Loop]       : 负责机械臂运动 (ServoP @ 100Hz)
@@ -389,6 +389,21 @@ python3 dobot_demo/dobot_demo/dataset_player.py data/episode_0.hdf5 --rate 0.5
 
 #### 6.1 查看统计报告
 
+
+减少因为servoP延迟增加的误差
+  使用流程
+
+  1. 先用无补偿模式录制一次评估数据
+     python3 playback_evaluator.py
+
+  2. 分析最优偏移值
+     python3 find_optimal_offset.py playback_eval/evaluation_X.hdf5
+
+  3. 用推荐的偏移值重新录制
+     python3 playback_evaluator.py --time-offset 737
+
+  4. 分析补偿后的跟踪精度
+     python3 analyze_playback.py playback_eval/evaluation_Y.hdf5
 ```bash
 cd /home/hit/dobot_ws_xing/src/DOBOT_6Axis_ROS2_V3
 

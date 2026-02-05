@@ -179,6 +179,14 @@ class PlaybackAnalyzer:
             print(f"  总帧数: {len(self.timestamps)}")  # 评估中记录的总数据点数
             print(f"  总时长: {self.timestamps[-1] - self.timestamps[0]:.2f} 秒")  # 评估持续时间
             print(f"  平均频率: {len(self.timestamps) / (self.timestamps[-1] - self.timestamps[0]):.1f} Hz")  # 采样频率
+
+            # 显示时间偏移补偿信息（如果有）
+            if 'time_offset_ms' in self.attrs:
+                offset_ms = self.attrs['time_offset_ms']
+                if offset_ms > 0:
+                    print(f"  时间偏移补偿: {offset_ms:.0f} ms")
+                else:
+                    print(f"  时间偏移补偿: 未使用（评估包含响应延迟）")
             print()
 
             return True

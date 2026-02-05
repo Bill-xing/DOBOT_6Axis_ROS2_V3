@@ -44,10 +44,28 @@ class PlaybackEvaluator(Node):
     播放评估录制器
 
     订阅目标和实际状态话题，同步录制用于评估播放质量
+
+    时间偏移补偿：
+    由于机械臂响应ServoP命令需要时间，评估时需要考虑这个延迟。
+    通过 time_offset 参数，将目标位置与延迟后的实际位置对齐，
+    从而得到更准确的跟踪误差评估。
     """
 
-    def __init__(self):
+    def __init__(self, time_offset=0.0):
+        """
+        初始化评估器
+
+        Args:
+            time_offset: 时间偏移补偿（秒）
+                        正值表示目标位置比实际位置早这么多时间
+                        推荐值：0.7秒（根据实际测试确定）
+        """
         super().__init__('playback_evaluator')
+
+        # 时间偏移补偿参数
+        self.time_offset = time_offset
+        if self.time_offset > 0:
+            self.get_logger().info(f"时间偏移补偿: {self.time_offset*1000:.0f} ms")
 
         # 配置
         self.data_dir = "./playback_eval"
@@ -59,12 +77,17 @@ class PlaybackEvaluator(Node):
         self.episode_buffer = []
 
         # 消息缓冲区（用于时间对齐）
+        # 缓冲区大小需要足够大以支持时间偏移补偿
+        # 假设100Hz采样，1秒延迟需要100个消息
+        buffer_size = max(100, int(self.time_offset * 150) + 50)  # 留有余量
         self.msg_buffer = {
-            'robot_target': deque(maxlen=100),
-            'robot_actual': deque(maxlen=100),
-            'gripper_target': deque(maxlen=100),
-            'gripper_actual': deque(maxlen=100),
+            'robot_target': deque(maxlen=buffer_size),
+            'robot_actual': deque(maxlen=buffer_size),
+            'gripper_target': deque(maxlen=buffer_size),
+            'gripper_actual': deque(maxlen=buffer_size),
         }
+        if self.time_offset > 0:
+            self.get_logger().info(f"消息缓冲区大小: {buffer_size}")
 
         # 消息计数
         self.msg_count = {
@@ -132,6 +155,13 @@ class PlaybackEvaluator(Node):
         self.get_logger().info("=" * 70)
         self.get_logger().info("播放评估录制器已启动")
         self.get_logger().info("=" * 70)
+        if self.time_offset > 0:
+            self.get_logger().info(f"⏱️  时间偏移补偿已启用: {self.time_offset*1000:.0f} ms")
+            self.get_logger().info("    评估模式: 稳态跟踪精度（补偿响应延迟）")
+        else:
+            self.get_logger().info("⏱️  时间偏移补偿: 未启用")
+            self.get_logger().info("    评估模式: 动态响应（包含响应延迟）")
+            self.get_logger().info("    提示: 使用 --time-offset 700 启用补偿")
         self.get_logger().info("等待播放器发布话题...")
         self.get_logger().info("提示：启动 dataset_player.py 开始播放，本节点将自动开始录制")
         self.get_logger().info(f"注意：将基于位置收敛检测自动开始录制（位置<{self.convergence_pos_threshold}mm，旋转<{self.convergence_rot_threshold}°）")
@@ -292,19 +322,33 @@ class PlaybackEvaluator(Node):
         """
         处理单帧数据：查找时间对齐的所有消息
 
-        以机械臂实际状态的时间戳为基准，查找最接近的其他消息
+        以机械臂实际状态的时间戳为基准，查找最接近的其他消息。
+
+        时间偏移补偿逻辑：
+        - reference_time 是实际位置消息的时间戳
+        - 目标位置应该查找 (reference_time - time_offset) 时刻的消息
+        - 这样对齐的是"过去发送的命令"与"当前实际位置"
+        - 更准确地反映机械臂的跟踪精度
         """
         try:
+            # 应用时间偏移补偿
+            # 目标位置：查找更早时刻的消息（机械臂需要时间响应）
+            target_time = reference_time - self.time_offset
+
             # 查找对齐的消息（50ms容差）
+            # 目标位置：使用偏移后的时间
             robot_target_match = self.find_closest_msg(
-                self.msg_buffer['robot_target'], reference_time, tolerance=0.05
+                self.msg_buffer['robot_target'], target_time, tolerance=0.05
             )
+            # 实际位置：使用当前时间
             robot_actual_match = self.find_closest_msg(
                 self.msg_buffer['robot_actual'], reference_time, tolerance=0.05
             )
+            # 夹爪目标：使用偏移后的时间
             gripper_target_match = self.find_closest_msg(
-                self.msg_buffer['gripper_target'], reference_time, tolerance=0.05
+                self.msg_buffer['gripper_target'], target_time, tolerance=0.05
             )
+            # 夹爪实际：使用当前时间
             gripper_actual_match = self.find_closest_msg(
                 self.msg_buffer['gripper_actual'], reference_time, tolerance=0.05
             )
@@ -465,17 +509,58 @@ class PlaybackEvaluator(Node):
                 f.attrs['evaluation_type'] = 'playback'
                 f.attrs['recording_frequency_hz'] = 100  # 基于机械臂反馈频率
                 f.attrs['time_tolerance_ms'] = 50  # 时间对齐容差
+                f.attrs['time_offset_ms'] = self.time_offset * 1000  # 时间偏移补偿
 
             self.get_logger().info(f"✓ 成功保存评估数据到 {file_path}")
             self.get_logger().info(f"  总帧数: {data_len}")
             self.get_logger().info(f"  总时长: {self.episode_buffer[-1]['timestamp'] - self.episode_buffer[0]['timestamp']:.2f} 秒")
+            if self.time_offset > 0:
+                self.get_logger().info(f"  时间偏移补偿: {self.time_offset*1000:.0f} ms")
 
         except Exception as e:
             self.get_logger().error(f"保存失败: {e}")
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = PlaybackEvaluator()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='播放评估录制器 - 评估数据集播放质量',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+时间偏移补偿说明：
+  由于机械臂响应ServoP命令需要时间（通常数百毫秒），
+  直接对比同一时刻的目标和实际位置会产生很大的"误差"。
+
+  使用 --time-offset 参数可以补偿这个延迟：
+  - 推荐值：700-800ms（根据 find_optimal_offset.py 分析结果）
+  - 设置后，评估器会将"过去的目标"与"当前实际"对齐
+  - 这样得到的误差更能反映真正的跟踪精度
+
+示例：
+  # 不使用补偿（评估响应延迟）
+  python3 playback_evaluator.py
+
+  # 使用700ms时间偏移补偿（评估稳态跟踪精度）
+  python3 playback_evaluator.py --time-offset 700
+
+  # 使用 find_optimal_offset.py 分析最优偏移值
+  python3 find_optimal_offset.py playback_eval/evaluation_X.hdf5
+        """
+    )
+
+    parser.add_argument('--time-offset', type=float, default=0.0,
+                       metavar='MS',
+                       help='时间偏移补偿（毫秒），推荐值：700-800。'
+                            '正值表示目标位置比实际位置早这么多时间。')
+
+    # 解析ROS参数之外的参数
+    parsed_args, remaining = parser.parse_known_args()
+
+    # 转换毫秒到秒
+    time_offset_sec = parsed_args.time_offset / 1000.0
+
+    rclpy.init(args=remaining)
+    node = PlaybackEvaluator(time_offset=time_offset_sec)
 
     try:
         rclpy.spin(node)
