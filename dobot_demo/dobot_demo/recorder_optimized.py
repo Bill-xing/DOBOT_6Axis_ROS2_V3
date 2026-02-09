@@ -685,13 +685,13 @@ class OptimizedDataRecorder(Node):
         参数：
             无
         """
-        self.get_logger().info(f"[DEBUG] Message counts (last 2s): "
-                              f"color={self.msg_count['color']}, "
-                              f"depth={self.msg_count['depth']}, "
-                              f"robot_curr={self.msg_count['robot_current']}, "
-                              f"robot_targ={self.msg_count['robot_target']}, "
-                              f"grip_curr={self.msg_count['gripper_current']}, "
-                              f"grip_targ={self.msg_count['gripper_target']}")
+        # self.get_logger().info(f"[DEBUG] Message counts (last 2s): "
+        #                       f"color={self.msg_count['color']}, "
+        #                       f"depth={self.msg_count['depth']}, "
+        #                       f"robot_curr={self.msg_count['robot_current']}, "
+        #                       f"robot_targ={self.msg_count['robot_target']}, "
+        #                       f"grip_curr={self.msg_count['gripper_current']}, "
+        #                       f"grip_targ={self.msg_count['gripper_target']}")
 
         if self.recording_state == 1:
             queue_size = len(self.pending_queue)

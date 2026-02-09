@@ -7,10 +7,12 @@
 ### 主要功能
 
 1. **读取HDF5数据**：自动扫描并加载所有 `episode_*.hdf5` 文件
-2. **视频编码**：将图像序列转换为标准MP4视频（H.264编码）
-3. **Parquet格式转换**：每个episode保存为一个Parquet文件
-4. **元数据生成**：自动生成所有必需的元数据文件
-5. **统计信息计算**：生成数据集的统计信息（min/max/mean/std）
+2. **支持多数据集合并**：可以合并多个目录的数据，自动重新编号episode
+3. **视频编码**：将图像序列转换为标准MP4视频（H.264编码）
+4. **Parquet格式转换**：每个episode保存为一个Parquet文件
+5. **元数据生成**：自动生成所有必需的元数据文件
+6. **统计信息计算**：生成数据集的统计信息（min/max/mean/std）
+7. **时间戳处理**：自动生成均匀时间戳，确保LeRobot兼容性
 
 ### 输出格式
 
@@ -24,8 +26,8 @@ lerobot_dataset/
 │       ├── episode_000001.parquet
 │       └── ...
 ├── videos/
-│   └── chunk-000/              # MP4 视频文件
-│       └── observation.images.top/
+│   └── observation.images.top/    # 相机视图
+│       └── chunk-000/              # MP4 视频文件
 │           ├── episode_000000.mp4
 │           ├── episode_000001.mp4
 │           └── ...
@@ -66,8 +68,18 @@ pip install h5py numpy tqdm pyarrow opencv-python pillow
 ```bash
 cd /home/hit/dobot_ws_xing/src/DOBOT_6Axis_ROS2_V3/dobot_demo/dobot_demo/convert
 
-# 转换数据集
+# 转换单个数据集
 python convert_to_lerobot.py --input ../data --output ./lerobot_dataset
+```
+
+### 合并多个数据集
+
+```bash
+# 方法1：多次指定 --input
+python convert_to_lerobot.py --input ./data1 --input ./data2 --output ./lerobot_dataset
+
+# 方法2：使用逗号分隔列表
+python convert_to_lerobot.py --input-list './data1,./data2,./data3' --output ./lerobot_dataset
 ```
 
 ### 完整参数示例
@@ -88,8 +100,9 @@ python convert_to_lerobot.py \
 
 | 参数 | 简写 | 类型 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `--input` | `-i` | string | `./data` | HDF5文件所在目录 |
-| `--output` | `-o` | string | `./lerobot_dataset` | 输出目录 |
+| `--input` | `-i` | string | `./data` | HDF5文件所在目录，可多次指定以合并多个数据集 |
+| `--input-list` | - | string | - | 逗号分隔的输入目录列表 |
+| `--output` | `-o` | string | `.../lerobot_dataset/dobot/teleop_dataset` | 输出目录 |
 | `--repo-id` | - | string | `dobot/teleop_dataset` | 数据集ID（用于Hugging Face） |
 | `--fps` | - | int | `30` | 视频帧率 |
 | `--video-codec` | - | string | `libx264` | 视频编码器 |
@@ -107,13 +120,14 @@ python convert_to_lerobot.py \
 episode_X.hdf5
 ├── observations/
 │   ├── images/
-│   │   └── color              # (N, H, W, 3) uint8 - RGB图像
+│   │   ├── color              # (N, H, W, 3) uint8 - BGR图像
+│   │   └── depth              # (N, H, W) float32 - 深度图（可选）
 │   ├── robot_current          # (N, 6) float32 - 当前位姿
 │   └── gripper_current        # (N, 1) float32 - 当前夹爪开度
 ├── actions/
 │   ├── robot_target           # (N, 6) float32 - 目标位姿
 │   └── gripper_target         # (N, 1) float32 - 目标夹爪开度
-├── timestamp                  # (N,) float64 - 时间戳
+├── timestamp                  # (N,) float64 - 时间戳（可选，将自动生成均匀时间戳）
 └── camera/
     └── intrinsics             # (3, 3) float32 - 相机内参（可选）
 ```
@@ -126,6 +140,10 @@ episode_X.hdf5
 
 - **gripper**: `[opening]` (夹爪开度)
   - 范围: 0-1000
+
+- **observation.state**: `[x, y, z, rx, ry, rz, gripper]` (7D状态)
+  - 前6维：当前位姿
+  - 第7维：夹爪开度
 
 - **action**: `[x, y, z, rx, ry, rz, gripper]` (7D动作)
   - 前6维：目标位姿
@@ -145,27 +163,71 @@ episode_X.hdf5
   "robot_type": "dobot_cr3",
   "total_episodes": 10,
   "total_frames": 3000,
+  "total_tasks": 1,
+  "total_videos": 10,
+  "total_chunks": 1,
   "chunks_size": 1000,
   "fps": 30,
 
+  "splits": {
+    "train": "0:10"
+  },
+
   "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-  "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+  "video_path": "videos/{video_key}/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.mp4",
 
   "features": {
+    "index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
     "observation.state": {
       "dtype": "float32",
-      "shape": [6],
-      "names": ["x", "y", "z", "rx", "ry", "rz"]
+      "shape": [7],
+      "names": ["x", "y", "z", "rx", "ry", "rz", "gripper"]
     },
     "observation.images.top": {
       "dtype": "video",
       "shape": [3, 480, 640],
-      "names": ["channel", "height", "width"]
+      "names": ["channel", "height", "width"],
+      "video_info": {
+        "video.fps": 30,
+        "video.codec": "libx264",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "has_audio": false
+      }
     },
     "action": {
       "dtype": "float32",
       "shape": [7],
       "names": ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+    },
+    "episode_index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
+    "frame_index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
+    "timestamp": {
+      "dtype": "float64",
+      "shape": [1],
+      "names": null
+    },
+    "task_index": {
+      "dtype": "int64",
+      "shape": [1],
+      "names": null
+    },
+    "next.done": {
+      "dtype": "bool",
+      "shape": [1],
+      "names": null
     }
   }
 }
@@ -175,18 +237,20 @@ episode_X.hdf5
 - `data_path`, `video_path`: 使用占位符格式（`{episode_chunk:03d}`, `{episode_index:06d}`, `{video_key}`）
 - `features`: 完整的数据schema定义
 - `chunks_size`: 每个chunk包含的episode数量（默认1000）
+- `splits`: HuggingFace 需要的数据集划分信息
+- `total_tasks`, `total_videos`, `total_chunks`: HuggingFace 需要的统计字段
 
-### 2. stats.json - 统计信息（新增）
+### 2. stats.json - 统计信息
 
 **独立文件**，包含数据集的统计信息：
 
 ```json
 {
   "observation.state": {
-    "min": [-400.59, -509.78, 222.05, -180.0, -0.11, 89.89],
-    "max": [397.70, -413.00, 391.51, 180.0, 0.11, 90.24],
-    "mean": [58.19, -461.82, 306.90, -142.85, -0.00, 90.00],
-    "std": [220.82, 16.13, 52.12, 104.75, 0.01, 0.01]
+    "min": [-400.59, -509.78, 222.05, -180.0, -0.11, 89.89, 320.0],
+    "max": [397.70, -413.00, 391.51, 180.0, 0.11, 90.24, 1000.0],
+    "mean": [58.19, -461.82, 306.90, -142.85, -0.00, 90.00, 700.74],
+    "std": [220.82, 16.13, 52.12, 104.75, 0.01, 0.01, 303.01]
   },
   "action": {
     "min": [-401.96, -509.90, 222.08, -180.0, -0.00, 90.0, 320.0],
@@ -226,12 +290,13 @@ episode_X.hdf5
 
 **Schema**:
 ```
+index: int64                          # 全局帧索引（跨所有episode连续编号）
 episode_index: int64
 frame_index: int64
 timestamp: float64
-observation.state: list<float32>[6]
-observation.images.top: struct<path: string, timestamp: float64>
-action: list<float32>[7]
+task_index: int64
+observation.state: list<float32>[7]   # 7D: 6D pose + gripper
+action: list<float32>[7]              # 7D: 6D pose + gripper
 next.done: bool
 ```
 
@@ -243,17 +308,17 @@ table = pq.read_table('data/chunk-000/episode_000000.parquet')
 df = table.to_pandas()
 
 # 输出:
-#    episode_index  frame_index  timestamp  observation.state  action  next.done
-# 0              0            0  12345.678  [x,y,z,rx,ry,rz]  [...]   False
-# 1              0            1  12345.711  [x,y,z,rx,ry,rz]  [...]   False
-# ...
-# 299            0          299  12355.678  [x,y,z,rx,ry,rz]  [...]   True
+#    index  episode_index  frame_index  timestamp  task_index  observation.state          action              next.done
+# 0      0              0            0    0.000000          0  [x,y,z,rx,ry,rz,g]  [x,y,z,rx,ry,rz,g]   False
+# 1      1              0            1    0.033333          0  [x,y,z,rx,ry,rz,g]  [x,y,z,rx,ry,rz,g]   False
+# ..
+# 299  299              0          299    9.966667          0  [x,y,z,rx,ry,rz,g]  [x,y,z,rx,ry,rz,g]   True
 ```
 
 ### 6. MP4 视频文件
 
 标准H.264编码的MP4视频：
-- 编码: libx264
+- 编码: mp4v (OpenCV VideoWriter)
 - 像素格式: yuv420p
 - 帧率: 30 fps（可配置）
 - 命名: `episode_{episode_index:06d}.mp4`
@@ -263,29 +328,31 @@ df = table.to_pandas()
 ## 转换流程
 
 ```
-1️⃣ 扫描 episode_*.hdf5 文件
-    └─ 按文件名排序
+1. 扫描 episode_*.hdf5 文件
+    └─ 从所有输入目录按文件名排序
+    └─ 自动重新编号（合并多个数据集时连续编号）
 
-2️⃣ 加载所有episodes
+2. 加载所有episodes
     └─ 读取图像、状态、动作数据
-    └─ 读取时间戳和相机内参
+    └─ 生成均匀时间戳（确保LeRobot兼容性）
+    └─ 读取相机内参（可选）
 
-3️⃣ 计算统计信息
-    └─ observation.state: min/max/mean/std
-    └─ action: min/max/mean/std
+3. 计算统计信息
+    └─ observation.state: min/max/mean/std (7D)
+    └─ action: min/max/mean/std (7D)
 
-4️⃣ 转换每个episode
+4. 转换每个episode
     └─ 编码MP4视频
     └─ 生成Parquet文件
     └─ 记录episode信息
 
-5️⃣ 保存元数据
+5. 保存元数据
     ├─ info.json (schema)
     ├─ stats.json (statistics)
     ├─ episodes.jsonl
     └─ tasks.jsonl
 
-6️⃣ 生成 README.md
+6. 生成 README.md
 ```
 
 ---
@@ -304,10 +371,10 @@ dataset = LeRobotDataset("dobot/teleop_cr3")
 sample = dataset[0]
 print(sample.keys())
 # dict_keys(['observation.state', 'observation.images.top', 'action',
-#            'episode_index', 'frame_index', 'timestamp', 'next.done'])
+#            'episode_index', 'frame_index', 'timestamp', 'task_index', 'next.done', 'index'])
 
 # 获取数据
-obs_state = sample['observation.state']      # torch.Tensor [6]
+obs_state = sample['observation.state']      # torch.Tensor [7]
 obs_image = sample['observation.images.top'] # torch.Tensor [C, H, W]
 action = sample['action']                     # torch.Tensor [7]
 ```
@@ -376,19 +443,22 @@ python convert_to_lerobot.py \
 ```
 === HDF5 to LeRobot v2.0 Converter ===
 Based on any4lerobot format specification
-Input:  ../data
+Input directories:
+  - ../data
 Output: ./my_dataset
 Repo:   my_org/dobot_demo
 
 Found 3 episodes in ../data
+
+Total episodes to convert: 3
 
 Loading episodes...
 Loading HDF5: 100%|████████████████| 3/3 [00:01<00:00, 2.10it/s]
 
 Computing dataset statistics...
 observation.state:
-  min: [-400.59, -509.78, 222.05, -180.0, -0.11, 89.89]
-  max: [397.70, -413.00, 391.51, 180.0, 0.11, 90.24]
+  min: [-400.59, -509.78, 222.05, -180.0, -0.11, 89.89, 320.0]
+  max: [397.70, -413.00, 391.51, 180.0, 0.11, 90.24, 1000.0]
 action:
   min: [-401.96, -509.90, 222.08, -180.0, -0.00, 90.0, 320.0]
   max: [397.70, -412.93, 391.59, -180.0, -0.00, 90.0, 1000.0]
@@ -411,7 +481,7 @@ Saving metadata...
 
 Dataset structure:
   - Parquet files: my_dataset/data/chunk-000
-  - Video files: my_dataset/videos/chunk-000
+  - Video files: my_dataset/videos/observation.images.top/chunk-000
   - Metadata: my_dataset/meta
     ├── info.json    (dataset schema)
     ├── stats.json   (statistics)
@@ -532,6 +602,22 @@ pip install --upgrade pyarrow
 # 确保 numpy array 是 contiguous 的
 ```
 
+### 问题 6: 时间戳警告信息
+
+**警告信息**:
+```
+⚠ All timestamps identical: 0.0
+→ Using generated uniform timestamps for LeRobot compatibility
+```
+
+**说明**:
+这是正常的警告信息。转换器会检测原始时间戳问题并自动生成均匀时间戳，以确保与LeRobot的兼容性。支持的检测包括：
+- 时间戳数量与帧数不匹配
+- 所有时间戳相同
+- 非单调递增时间戳
+- 时间间隔过大
+- 零时间间隔
+
 ---
 
 ## 性能指标
@@ -558,7 +644,7 @@ pip install --upgrade pyarrow
 
 本转换器完全兼容 [any4lerobot](https://github.com/Tavish9/any4lerobot) 规范：
 
-✅ 支持特性：
+支持特性：
 - Parquet + MP4 格式
 - 标准路径占位符格式
 - VideoFrame 结构
@@ -566,6 +652,8 @@ pip install --upgrade pyarrow
 - tasks.jsonl 格式
 - 独立的 stats.json 文件
 - 完整的 features schema
+- 全局帧索引 (index)
+- 任务索引 (task_index)
 
 ---
 
@@ -623,22 +711,49 @@ api.upload_folder(
 - 自定义训练pipeline
 - 其他支持 LeRobot 格式的工具
 
+### Q5: 如何合并多个数据集？
+
+使用多输入目录功能：
+```bash
+# 方法1：多次指定 --input
+python convert_to_lerobot.py --input ./data1 --input ./data2 --output ./merged_dataset
+
+# 方法2：使用逗号分隔列表
+python convert_to_lerobot.py --input-list './data1,./data2,./data3' --output ./merged_dataset
+```
+转换器会自动按顺序重新编号所有episode，确保索引连续。
+
+### Q6: observation.state 和 action 的维度是多少？
+
+两者都是 **7维**：
+- `observation.state`: `[x, y, z, rx, ry, rz, gripper]` - 当前机器人状态
+- `action`: `[x, y, z, rx, ry, rz, gripper]` - 目标动作
+
 ---
 
 ## 更新日志
 
+### v2.1 (2025-01)
+- 支持多数据集合并（--input 可多次指定，--input-list 逗号分隔）
+- 自动重新编号episode（合并多个数据集时连续编号）
+- 添加全局帧索引 (index) 字段
+- 添加任务索引 (task_index) 字段
+- 自动检测并修复时间戳问题（生成均匀时间戳）
+- observation.state 扩展为 7D（包含 gripper）
+- 添加 HuggingFace 需要的字段（splits, total_tasks, total_videos, total_chunks）
+
 ### v2.0 (2024-01-18)
-- ✨ 生成独立的 stats.json 文件
-- ✨ 使用标准路径占位符格式
-- ✨ 修正 features schema（标量字段使用 [1]）
-- ✅ 完全兼容 any4lerobot 规范
-- 📝 完善文档和注释
+- 生成独立的 stats.json 文件
+- 使用标准路径占位符格式
+- 修正 features schema（标量字段使用 [1]）
+- 完全兼容 any4lerobot 规范
+- 完善文档和注释
 
 ### v1.0 (2024)
-- ✨ 初始版本
-- ✅ 支持 HDF5 到 LeRobot v2.0 转换
-- ✅ Parquet + MP4 格式
-- ✅ 自动生成元数据
+- 初始版本
+- 支持 HDF5 到 LeRobot v2.0 转换
+- Parquet + MP4 格式
+- 自动生成元数据
 
 ---
 
@@ -647,4 +762,4 @@ api.upload_folder(
 - **开发团队**: DOBOT Team
 - **参考规范**: [any4lerobot](https://github.com/Tavish9/any4lerobot)
 - **LeRobot**: [huggingface/lerobot](https://github.com/huggingface/lerobot)
-- **更新日期**: 2024-01-18
+- **更新日期**: 2025-01
